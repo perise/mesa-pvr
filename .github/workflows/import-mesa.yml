@@ -15,13 +15,13 @@ jobs:
         with:
           path: patches-repo
 
-      - name: Clone Mesa (depth=600)
+      - name: Clone Mesa (depth=1000)
         run: |
-          git clone --depth=600 --single-branch --branch main \
+          git clone --depth=1000 --single-branch --branch main \
             https://gitlab.freedesktop.org/mesa/mesa.git mesa
           cd mesa
           git log --oneline | grep -q cff8dbd && echo "BASE FOUND" \
-            || { echo "cff8dbd not found in depth=600"; exit 1; }
+            || { echo "cff8dbd not found in depth=1000"; exit 1; }
 
       - name: Apply K3 patches
         run: |
@@ -32,11 +32,14 @@ jobs:
           git am ../patches-repo/000*.patch
           git log --oneline -8
 
-      - name: Push to GitHub (no-thin fat pack)
+      - name: Push to GitHub
         env:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           cd mesa
+          # Large postBuffer avoids chunked transfer that breaks index-pack
+          git config http.postBuffer 524288000
+          git config http.version HTTP/1.1
           DEST="https://x-access-token:${TOKEN}@github.com/perise/mesa-pvr.git"
           git remote add dest "$DEST"
           echo "=== Push main -> mesa-upstream ==="

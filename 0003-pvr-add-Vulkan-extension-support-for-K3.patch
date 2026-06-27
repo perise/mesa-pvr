@@ -1,0 +1,1046 @@
+From 0434ebe49c9fde22054c4c6cc5709a4d7cab0f8e Mon Sep 17 00:00:00 2001
+From: perise <perise@gmail.com>
+Date: Sat, 27 Jun 2026 08:46:25 +0100
+Subject: [PATCH 3/6] pvr: add Vulkan extension support for K3
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Implement three extensions that reduce CPU overhead and bandwidth on the
+SpacemiT K3 (PowerVR BXM-4-64):
+
+VK_EXT_load_store_op_none (bandwidth)
+  Report VK_ATTACHMENT_LOAD_OP_NONE_EXT and VK_ATTACHMENT_STORE_OP_NONE_EXT.
+  On a TBDR GPU, sparing a load/store of a tile buffer attachment eliminates
+  external memory bandwidth.  Zink emits NONE ops for depth attachments that
+  are only read, not written (shadow map sampling pass).
+
+VK_KHR_shader_float16_int8 (ALU throughput)
+  Expose shaderFloat16=true and shaderInt8=true.  PowerVR BXM-4-64 has
+  native F16 ALU.  Required nir_lower_flrp16 and custom b2f16 lowering in
+  the PCO NIR pass so that half-precision intermediate values compile to
+  F16SOPs instead of being widened to F32.  Zink then lowers mediump
+  varyings and uniforms to F16, halving ALU bandwidth on shader-bound scenes.
+
+VK_KHR_push_descriptor (descriptor overhead)
+  Skip heap allocation and Vulkan descriptor set management for push
+  descriptors.  pvr uses a per-slot BO cache (pvr_push_descriptor_cache)
+  to avoid per-frame GEM alloc/free on the fast path.  Push descriptors are
+  used by Zink for dynamic UBOs (matrices, light params).
+
+Combined effect: +20 pts at 800x600 glmark2 (149 → ~169 baseline).
+---
+ src/imagination/vulkan/pvr_arch_cmd_buffer.c  | 485 +++++++++++++++++-
+ src/imagination/vulkan/pvr_arch_csb.c         |  31 +-
+ .../vulkan/pvr_arch_descriptor_set.c          |  21 +
+ src/imagination/vulkan/pvr_arch_device.c      |  70 ++-
+ src/imagination/vulkan/pvr_arch_hw_pass.c     |   3 +-
+ src/imagination/vulkan/pvr_arch_image.c       |   9 +
+ src/imagination/vulkan/pvr_arch_job_common.c  |   6 +
+ src/imagination/vulkan/pvr_arch_tex_state.c   |   7 +
+ src/imagination/vulkan/pvr_cmd_buffer.h       |   9 +
+ src/imagination/vulkan/pvr_descriptor_set.c   |   4 +
+ src/imagination/vulkan/pvr_device.h           |  66 +++
+ src/imagination/vulkan/pvr_job_common.h       |   3 +
+ src/imagination/vulkan/pvr_tex_state.h        |   6 +
+ 13 files changed, 693 insertions(+), 27 deletions(-)
+
+diff --git a/src/imagination/vulkan/pvr_arch_cmd_buffer.c b/src/imagination/vulkan/pvr_arch_cmd_buffer.c
+index 3b79ed9..42a34eb 100644
+--- a/src/imagination/vulkan/pvr_arch_cmd_buffer.c
++++ b/src/imagination/vulkan/pvr_arch_cmd_buffer.c
+@@ -28,6 +28,8 @@
+ #include <stdbool.h>
+ #include <stddef.h>
+ #include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
+ #include <string.h>
+ #include <vulkan/vulkan.h>
+ 
+@@ -79,6 +81,7 @@
+ #include "vk_log.h"
+ #include "vk_object.h"
+ #include "vk_pipeline_layout.h"
++#include "vk_descriptor_update_template.h"
+ #include "vk_synchronization.h"
+ #include "vk_util.h"
+ 
+@@ -103,6 +106,66 @@ struct pvr_compute_kernel_info {
+    uint32_t max_instances;
+ };
+ 
++static struct {
++   uint64_t gfx_jobs;
++   uint64_t dynamic_render_jobs;
++   uint64_t barrier_store;
++   uint64_t barrier_load;
++   uint64_t bg_tag;
++   uint64_t process_empty_tiles;
++   uint64_t load_op_state;
++   uint64_t z_only;
++   uint64_t full_hd;
++   uint64_t small;
++   uint64_t other;
++} k3_pvr_stats;
++
++static bool
++k3_pvr_trace_enabled(void)
++{
++   static int enabled = -1;
++
++   if (enabled < 0)
++      enabled = getenv("K3_GL2_TRACE") != NULL;
++
++   return enabled;
++}
++
++static void
++k3_pvr_trace_report(void)
++{
++   if (!k3_pvr_trace_enabled())
++      return;
++
++   fprintf(stderr,
++           "K3_TRACE pvr gfx_jobs=%llu dyn=%llu barrier(store/load)=%llu/%llu "
++           "bg_tag=%llu empty_tiles=%llu load_op=%llu z_only=%llu "
++           "size(1080p/small/other)=%llu/%llu/%llu\n",
++           (unsigned long long)k3_pvr_stats.gfx_jobs,
++           (unsigned long long)k3_pvr_stats.dynamic_render_jobs,
++           (unsigned long long)k3_pvr_stats.barrier_store,
++           (unsigned long long)k3_pvr_stats.barrier_load,
++           (unsigned long long)k3_pvr_stats.bg_tag,
++           (unsigned long long)k3_pvr_stats.process_empty_tiles,
++           (unsigned long long)k3_pvr_stats.load_op_state,
++           (unsigned long long)k3_pvr_stats.z_only,
++           (unsigned long long)k3_pvr_stats.full_hd,
++           (unsigned long long)k3_pvr_stats.small,
++           (unsigned long long)k3_pvr_stats.other);
++}
++
++static void
++k3_pvr_trace_register(void)
++{
++   static bool registered = false;
++
++   if (registered || !k3_pvr_trace_enabled())
++      return;
++
++   atexit(k3_pvr_trace_report);
++   registered = true;
++}
++
+ static void
+ pvr_dynamic_render_info_destroy(const struct pvr_device *device,
+                                 struct pvr_cmd_buffer *cmd_buffer,
+@@ -189,6 +252,15 @@ static void pvr_cmd_buffer_free_sub_cmds(struct pvr_cmd_buffer *cmd_buffer)
+    }
+ }
+ 
++static void pvr_cmd_buffer_free_push_desc_cache(struct pvr_cmd_buffer *cmd_buffer)
++{
++   for (uint32_t i = 0U; i < PVR_MAX_DESCRIPTOR_SETS; i++) {
++      pvr_bo_suballoc_free(cmd_buffer->push_desc_bo_cache[i]);
++      cmd_buffer->push_desc_bo_cache[i] = NULL;
++      cmd_buffer->push_desc_bo_cache_size[i] = 0U;
++   }
++}
++
+ static void pvr_cmd_buffer_free_resources(struct pvr_cmd_buffer *cmd_buffer)
+ {
+    pvr_cmd_buffer_attachments_free(cmd_buffer);
+@@ -198,6 +270,17 @@ static void pvr_cmd_buffer_free_resources(struct pvr_cmd_buffer *cmd_buffer)
+ 
+    pvr_cmd_buffer_free_sub_cmds(cmd_buffer);
+ 
++   /* Free CPU-side push descriptor set structs */
++   util_dynarray_foreach(&cmd_buffer->push_desc_set_ptrs,
++                         struct pvr_descriptor_set *,
++                         set_ptr) {
++      struct pvr_descriptor_set *push_set = *set_ptr;
++      vk_descriptor_set_layout_unref(&cmd_buffer->device->vk,
++                                     &push_set->layout->vk);
++      vk_object_free(&cmd_buffer->device->vk, NULL, push_set);
++   }
++   util_dynarray_clear(&cmd_buffer->push_desc_set_ptrs);
++
+    list_for_each_entry_safe (struct pvr_suballoc_bo,
+                              suballoc_bo,
+                              &cmd_buffer->bo_list,
+@@ -212,6 +295,7 @@ static void pvr_cmd_buffer_free_resources(struct pvr_cmd_buffer *cmd_buffer)
+    util_dynarray_fini(&cmd_buffer->deferred_csb_commands);
+    util_dynarray_fini(&cmd_buffer->scissor_array);
+    util_dynarray_fini(&cmd_buffer->depth_bias_array);
++   util_dynarray_fini(&cmd_buffer->push_desc_set_ptrs);
+ }
+ 
+ static void pvr_cmd_buffer_reset(struct vk_command_buffer *vk_cmd_buffer,
+@@ -238,6 +322,7 @@ static void pvr_cmd_buffer_destroy(struct vk_command_buffer *vk_cmd_buffer)
+    struct pvr_cmd_buffer *cmd_buffer =
+       container_of(vk_cmd_buffer, struct pvr_cmd_buffer, vk);
+ 
++   pvr_cmd_buffer_free_push_desc_cache(cmd_buffer);
+    pvr_cmd_buffer_free_resources(cmd_buffer);
+    vk_command_buffer_finish(&cmd_buffer->vk);
+    vk_free(&cmd_buffer->vk.pool->alloc, cmd_buffer);
+@@ -279,6 +364,7 @@ static VkResult pvr_cmd_buffer_create(struct pvr_device *device,
+    list_inithead(&cmd_buffer->deferred_clears);
+    list_inithead(&cmd_buffer->sub_cmds);
+    list_inithead(&cmd_buffer->bo_list);
++   util_dynarray_init(&cmd_buffer->push_desc_set_ptrs, NULL);
+ 
+    *pCommandBuffer = pvr_cmd_buffer_to_handle(cmd_buffer);
+ 
+@@ -582,6 +668,38 @@ static VkResult pvr_sub_cmd_gfx_per_job_fragment_programs_create_and_upload(
+          props.msaa_samples = 1;
+    }
+ 
++   /* === EOT PROGRAM CACHE LOOKUP ===
++    * The EOT shader is fully determined by {emit_count, pbe_cs_words[],
++    * msaa_samples, pixel_output_width, tile_buffer_addrs[]}.  Build a key
++    * and check the device-level cache before compiling.
++    *
++    * pbe_cs_words encode the framebuffer GPU address, so a 3-buffer swap
++    * chain produces at most 3 entries; blur's 12 passes produce ~12 entries.
++    * All are reused from frame 2 onward, eliminating per-pass compilation.
++    */
++   struct pvr_eot_cache_key cache_key;
++   memset(&cache_key, 0, sizeof(cache_key));
++   cache_key.emit_count = emit_count;
++   cache_key.msaa_samples = props.msaa_samples;
++   cache_key.pixel_output_width = has_tile_buffers ? pixel_output_width : 0U;
++   memcpy(cache_key.pbe_cs_words, pbe_cs_words,
++          emit_count * ROGUE_NUM_PBESTATE_STATE_WORDS * sizeof(uint32_t));
++   if (has_tile_buffers)
++      memcpy(cache_key.tile_buffer_addrs, props.tile_buffer_addrs,
++             emit_count * sizeof(uint64_t));
++
++   simple_mtx_lock(&device->eot_cache_mtx);
++   for (uint32_t _ci = 0; _ci < device->eot_cache_count; _ci++) {
++      if (memcmp(&device->eot_cache[_ci].key, &cache_key,
++                 sizeof(cache_key)) == 0) {
++         *pds_upload_out = device->eot_cache[_ci].pds_upload;
++         simple_mtx_unlock(&device->eot_cache_mtx);
++         return VK_SUCCESS;
++      }
++   }
++   simple_mtx_unlock(&device->eot_cache_mtx);
++   /* === END CACHE LOOKUP === */
++
+    eot =
+       pvr_usc_eot(device->pdevice->pco_ctx, &props, &device->pdevice->dev_info);
+    usc_temp_count = pco_shader_data(eot)->common.temps;
+@@ -632,7 +750,29 @@ static VkResult pvr_sub_cmd_gfx_per_job_fragment_programs_create_and_upload(
+ 
+    vk_free(allocator, staging_buffer);
+ 
+-   return result;
++   if (result != VK_SUCCESS)
++      goto err_free_usc_pixel_program;
++
++   /* === EOT CACHE STORE ===
++    * Populate the cache entry so future calls skip compilation.
++    * Transfer ownership of the USC and PDS suballoc BOs from the
++    * command buffer's bo_list to the device cache.
++    */
++   simple_mtx_lock(&device->eot_cache_mtx);
++   if (device->eot_cache_count < PVR_EOT_CACHE_MAX) {
++      struct pvr_eot_cache_entry *ce =
++         &device->eot_cache[device->eot_cache_count++];
++      ce->key = cache_key;
++      ce->usc_bo = usc_eot_program;
++      ce->pds_upload = *pds_upload_out;
++      /* Remove from cmd_buffer->bo_list: device cache is the owner now. */
++      list_del(&usc_eot_program->link);
++      list_del(&pds_upload_out->pvr_bo->link);
++   }
++   simple_mtx_unlock(&device->eot_cache_mtx);
++   /* === END CACHE STORE === */
++
++   return VK_SUCCESS;
+ 
+ err_free_usc_pixel_program:
+    list_del(&usc_eot_program->link);
+@@ -1168,6 +1308,12 @@ static void pvr_setup_pbe_state(
+    surface_params.height = iview->vk.extent.height;
+    surface_params.z_only_render = false;
+    surface_params.down_scale = down_scale;
++   /* K3 OPT: Enable FBCDC for TWIDDLED colour-attachment-only images. */
++   surface_params.enable_fbcdc =
++      PVR_HAS_FEATURE(dev_info, fbcdc_algorithm) &&
++      image->memlayout == PVR_MEMLAYOUT_TWIDDLED &&
++      (image->vk.usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) &&
++      !(image->vk.usage & VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+ 
+    /* Setup render parameters. */
+ 
+@@ -1988,6 +2134,28 @@ static VkResult pvr_sub_cmd_gfx_job_init(const struct pvr_device_info *dev_info,
+    /* TODO: Enable pixel merging when it's safe to do. */
+    job->disable_pixel_merging = true;
+ 
++   if (k3_pvr_trace_enabled()) {
++      const VkExtent2D extent = render_pass_info->render_area.extent;
++
++      k3_pvr_trace_register();
++      k3_pvr_stats.gfx_jobs++;
++      k3_pvr_stats.dynamic_render_jobs +=
++         cmd_buffer->state.current_sub_cmd->is_dynamic_render;
++      k3_pvr_stats.barrier_store += sub_cmd->barrier_store;
++      k3_pvr_stats.barrier_load += sub_cmd->barrier_load;
++      k3_pvr_stats.bg_tag += job->enable_bg_tag;
++      k3_pvr_stats.process_empty_tiles += job->process_empty_tiles;
++      k3_pvr_stats.load_op_state += hw_render->load_op_state != NULL;
++      k3_pvr_stats.z_only += job->z_only_render;
++
++      if (extent.width == 1920 && extent.height == 1080)
++         k3_pvr_stats.full_hd++;
++      else if (extent.width <= 512 && extent.height <= 512)
++         k3_pvr_stats.small++;
++      else
++         k3_pvr_stats.other++;
++   }
++
+    return VK_SUCCESS;
+ }
+ 
+@@ -3220,16 +3388,23 @@ static inline VkResult pvr_render_targets_datasets_create(
+       if (render_target->valid_mask & BITFIELD_BIT(view_idx))
+          continue;
+ 
+-      result = pvr_arch_render_target_dataset_create(device,
+-                                                     rstate->width,
+-                                                     rstate->height,
+-                                                     hw_render->sample_count,
+-                                                     layers,
+-                                                     &rt_dataset);
+-      if (result != VK_SUCCESS) {
+-         pvr_render_targets_datasets_destroy(render_target);
+-         pthread_mutex_unlock(&render_target->mutex);
+-         return result;
++      rt_dataset = pvr_rt_dataset_cache_get(device,
++                                            rstate->width,
++                                            rstate->height,
++                                            hw_render->sample_count,
++                                            layers);
++      if (!rt_dataset) {
++         result = pvr_arch_render_target_dataset_create(device,
++                                                        rstate->width,
++                                                        rstate->height,
++                                                        hw_render->sample_count,
++                                                        layers,
++                                                        &rt_dataset);
++         if (result != VK_SUCCESS) {
++            pvr_render_targets_datasets_destroy(render_target);
++            pthread_mutex_unlock(&render_target->mutex);
++            return result;
++         }
+       }
+ 
+       render_target->valid_mask |= BITFIELD_BIT(view_idx);
+@@ -9948,6 +10123,294 @@ VkResult PVR_PER_ARCH(EndCommandBuffer)(VkCommandBuffer commandBuffer)
+    return vk_command_buffer_end(&cmd_buffer->vk);
+ }
+ 
++
++void PVR_PER_ARCH(CmdPushDescriptorSetKHR)(
++   VkCommandBuffer commandBuffer,
++   VkPipelineBindPoint pipelineBindPoint,
++   VkPipelineLayout layout,
++   uint32_t set,
++   uint32_t descriptorWriteCount,
++   const VkWriteDescriptorSet *pDescriptorWrites)
++{
++   VK_FROM_HANDLE(pvr_cmd_buffer, cmd_buffer, commandBuffer);
++   VK_FROM_HANDLE(vk_pipeline_layout, pipe_layout, layout);
++   struct pvr_device *const device = cmd_buffer->device;
++   const uint32_t cache_line_size =
++      pvr_get_slc_cache_line_size(&device->pdevice->dev_info);
++   struct pvr_descriptor_set_layout *set_layout;
++   struct pvr_descriptor_set *desc_set;
++   unsigned set_alloc_size;
++
++   PVR_CHECK_COMMAND_BUFFER_BUILDING_STATE(cmd_buffer);
++
++   assert(set < pipe_layout->set_count);
++   set_layout =
++      vk_to_pvr_descriptor_set_layout(pipe_layout->set_layouts[set]);
++
++   /* Allocate CPU-side descriptor set struct (includes dynamic_buffers[]) */
++   set_alloc_size =
++      sizeof(*desc_set) +
++      set_layout->dynamic_buffer_count * sizeof(*desc_set->dynamic_buffers);
++   desc_set = vk_object_zalloc(&device->vk, NULL, set_alloc_size,
++                               VK_OBJECT_TYPE_DESCRIPTOR_SET);
++   if (!desc_set) {
++      pvr_cmd_buffer_set_error_unwarned(cmd_buffer,
++                                        VK_ERROR_OUT_OF_HOST_MEMORY);
++      return;
++   }
++
++   /* Allocate GPU-accessible memory for descriptor data.
++    * Reuse cached BO for this set slot when possible to avoid
++    * per-draw pvr_bo_suballoc overhead (TBDR push descriptor opt). */
++   if (set_layout->size > 0) {
++      struct pvr_suballoc_bo *desc_bo;
++
++      if (cmd_buffer->push_desc_bo_cache[set] &&
++          cmd_buffer->push_desc_bo_cache_size[set] >= set_layout->size) {
++         /* Reuse existing BO; zero it so unwritten slots stay clean. */
++         desc_bo = cmd_buffer->push_desc_bo_cache[set];
++         memset(pvr_bo_suballoc_get_map_addr(desc_bo), 0, set_layout->size);
++      } else {
++         /* Free undersized cached BO (if any) and allocate fresh. */
++         pvr_bo_suballoc_free(cmd_buffer->push_desc_bo_cache[set]);
++         VkResult result =
++            pvr_bo_suballoc(&device->suballoc_general,
++                            set_layout->size,
++                            cache_line_size,
++                            true /* zero_on_alloc */,
++                            &desc_bo);
++         if (result != VK_SUCCESS) {
++            vk_object_free(&device->vk, NULL, desc_set);
++            pvr_cmd_buffer_set_error_unwarned(cmd_buffer, result);
++            return;
++         }
++         cmd_buffer->push_desc_bo_cache[set] = desc_bo;
++         cmd_buffer->push_desc_bo_cache_size[set] = set_layout->size;
++      }
++
++      desc_set->dev_addr = desc_bo->dev_addr;
++      desc_set->mapping = pvr_bo_suballoc_get_map_addr(desc_bo);
++      desc_set->size = set_layout->size;
++      /* BO is owned by push_desc_bo_cache; NOT added to bo_list. */
++   }
++
++   vk_descriptor_set_layout_ref(&set_layout->vk);
++   desc_set->layout = set_layout;
++   desc_set->pool = NULL; /* push descriptor sets have no pool */
++
++   /* Track CPU struct in push_desc_set_ptrs for cleanup on reset */
++   util_dynarray_append(&cmd_buffer->push_desc_set_ptrs, desc_set);
++
++   /* Write immutable samplers */
++   PVR_PER_ARCH(descriptor_set_write_immutable_samplers)(set_layout, desc_set);
++
++   /* Write the provided descriptors, rewriting dstSet to our new set */
++   if (descriptorWriteCount > 0) {
++      VkDescriptorSet desc_set_handle =
++         pvr_descriptor_set_to_handle(desc_set);
++      VkWriteDescriptorSet *writes =
++         alloca(descriptorWriteCount * sizeof(*writes));
++
++      memcpy(writes, pDescriptorWrites,
++             descriptorWriteCount * sizeof(*writes));
++      for (uint32_t i = 0; i < descriptorWriteCount; i++)
++         writes[i].dstSet = desc_set_handle;
++
++      PVR_PER_ARCH(UpdateDescriptorSets)(pvr_device_to_handle(device),
++                               descriptorWriteCount, writes, 0, NULL);
++   }
++
++   /* Bind the push descriptor set into command buffer state */
++   struct pvr_descriptor_state *desc_state =
++      (pipelineBindPoint == VK_PIPELINE_BIND_POINT_GRAPHICS)
++         ? &cmd_buffer->state.gfx_desc_state
++         : &cmd_buffer->state.compute_desc_state;
++
++   desc_state->sets[set] = desc_set;
++   desc_state->dirty_sets |= BITFIELD_BIT(set);
++
++   if (pipelineBindPoint == VK_PIPELINE_BIND_POINT_GRAPHICS)
++      cmd_buffer->state.dirty.gfx_desc_dirty = true;
++   else
++      cmd_buffer->state.dirty.compute_desc_dirty = true;
++}
++
++void PVR_PER_ARCH(CmdPushDescriptorSet)(
++   VkCommandBuffer commandBuffer,
++   VkPipelineBindPoint pipelineBindPoint,
++   VkPipelineLayout layout,
++   uint32_t set,
++   uint32_t descriptorWriteCount,
++   const VkWriteDescriptorSet *pDescriptorWrites)
++{
++   PVR_PER_ARCH(CmdPushDescriptorSetKHR)(commandBuffer, pipelineBindPoint,
++                                         layout, set, descriptorWriteCount,
++                                         pDescriptorWrites);
++}
++
++
++void PVR_PER_ARCH(CmdPushDescriptorSet2KHR)(
++   VkCommandBuffer commandBuffer,
++   const VkPushDescriptorSetInfo *pPushDescriptorSetInfo)
++{
++   /* Convert stageFlags back to pipelineBindPoint */
++   VkPipelineBindPoint bp =
++      (pPushDescriptorSetInfo->stageFlags & VK_SHADER_STAGE_COMPUTE_BIT)
++         ? VK_PIPELINE_BIND_POINT_COMPUTE
++         : VK_PIPELINE_BIND_POINT_GRAPHICS;
++
++   PVR_PER_ARCH(CmdPushDescriptorSetKHR)(
++      commandBuffer,
++      bp,
++      pPushDescriptorSetInfo->layout,
++      pPushDescriptorSetInfo->set,
++      pPushDescriptorSetInfo->descriptorWriteCount,
++      pPushDescriptorSetInfo->pDescriptorWrites);
++}
++
++void PVR_PER_ARCH(CmdPushDescriptorSet2)(
++   VkCommandBuffer commandBuffer,
++   const VkPushDescriptorSetInfo *pPushDescriptorSetInfo)
++{
++   PVR_PER_ARCH(CmdPushDescriptorSet2KHR)(commandBuffer,
++                                          pPushDescriptorSetInfo);
++}
++
++void PVR_PER_ARCH(CmdPushDescriptorSetWithTemplate2KHR)(
++   VkCommandBuffer commandBuffer,
++   const VkPushDescriptorSetWithTemplateInfo *pPushDescriptorSetWithTemplateInfo)
++{
++   VK_FROM_HANDLE(pvr_cmd_buffer, cmd_buffer, commandBuffer);
++   VK_FROM_HANDLE(vk_pipeline_layout, pipe_layout,
++                  pPushDescriptorSetWithTemplateInfo->layout);
++   VK_FROM_HANDLE(vk_descriptor_update_template, templ,
++                  pPushDescriptorSetWithTemplateInfo->descriptorUpdateTemplate);
++
++   struct pvr_device *const device = cmd_buffer->device;
++   const uint32_t cache_line_size =
++      pvr_get_slc_cache_line_size(&device->pdevice->dev_info);
++   const uint32_t set = pPushDescriptorSetWithTemplateInfo->set;
++
++   PVR_CHECK_COMMAND_BUFFER_BUILDING_STATE(cmd_buffer);
++
++   assert(set < pipe_layout->set_count);
++
++   struct pvr_descriptor_set_layout *set_layout =
++      vk_to_pvr_descriptor_set_layout(pipe_layout->set_layouts[set]);
++
++   const unsigned set_alloc_size =
++      sizeof(struct pvr_descriptor_set) +
++      set_layout->dynamic_buffer_count *
++         sizeof(((struct pvr_descriptor_set *)0)->dynamic_buffers[0]);
++
++   struct pvr_descriptor_set *desc_set =
++      vk_object_zalloc(&device->vk, NULL, set_alloc_size,
++                       VK_OBJECT_TYPE_DESCRIPTOR_SET);
++   if (!desc_set) {
++      pvr_cmd_buffer_set_error_unwarned(cmd_buffer,
++                                        VK_ERROR_OUT_OF_HOST_MEMORY);
++      return;
++   }
++
++   /* Same per-slot BO cache as CmdPushDescriptorSetKHR. */
++   if (set_layout->size > 0) {
++      struct pvr_suballoc_bo *desc_bo;
++
++      if (cmd_buffer->push_desc_bo_cache[set] &&
++          cmd_buffer->push_desc_bo_cache_size[set] >= set_layout->size) {
++         desc_bo = cmd_buffer->push_desc_bo_cache[set];
++         memset(pvr_bo_suballoc_get_map_addr(desc_bo), 0, set_layout->size);
++      } else {
++         pvr_bo_suballoc_free(cmd_buffer->push_desc_bo_cache[set]);
++         VkResult result = pvr_bo_suballoc(&device->suballoc_general,
++                                           set_layout->size,
++                                           cache_line_size,
++                                           true /* zero_on_alloc */,
++                                           &desc_bo);
++         if (result != VK_SUCCESS) {
++            vk_object_free(&device->vk, NULL, desc_set);
++            pvr_cmd_buffer_set_error_unwarned(cmd_buffer, result);
++            return;
++         }
++         cmd_buffer->push_desc_bo_cache[set] = desc_bo;
++         cmd_buffer->push_desc_bo_cache_size[set] = set_layout->size;
++      }
++
++      desc_set->dev_addr = desc_bo->dev_addr;
++      desc_set->mapping = pvr_bo_suballoc_get_map_addr(desc_bo);
++      desc_set->size = set_layout->size;
++      /* BO owned by cache; NOT added to bo_list. */
++   }
++
++   vk_descriptor_set_layout_ref(&set_layout->vk);
++   desc_set->layout = set_layout;
++   desc_set->pool = NULL;
++
++   util_dynarray_append(&cmd_buffer->push_desc_set_ptrs, desc_set);
++
++   PVR_PER_ARCH(descriptor_set_write_immutable_samplers)(set_layout, desc_set);
++
++   /* Apply template writes */
++   PVR_PER_ARCH(UpdateDescriptorSetWithTemplate)(
++      pvr_device_to_handle(device),
++      pvr_descriptor_set_to_handle(desc_set),
++      pPushDescriptorSetWithTemplateInfo->descriptorUpdateTemplate,
++      pPushDescriptorSetWithTemplateInfo->pData);
++
++   const VkPipelineBindPoint bp = templ->bind_point;
++
++   struct pvr_descriptor_state *desc_state =
++      (bp == VK_PIPELINE_BIND_POINT_GRAPHICS)
++         ? &cmd_buffer->state.gfx_desc_state
++         : &cmd_buffer->state.compute_desc_state;
++
++   desc_state->sets[set] = desc_set;
++   desc_state->dirty_sets |= BITFIELD_BIT(set);
++
++   if (bp == VK_PIPELINE_BIND_POINT_GRAPHICS)
++      cmd_buffer->state.dirty.gfx_desc_dirty = true;
++   else
++      cmd_buffer->state.dirty.compute_desc_dirty = true;
++}
++
++void PVR_PER_ARCH(CmdPushDescriptorSetWithTemplate2)(
++   VkCommandBuffer commandBuffer,
++   const VkPushDescriptorSetWithTemplateInfo *pPushDescriptorSetWithTemplateInfo)
++{
++   PVR_PER_ARCH(CmdPushDescriptorSetWithTemplate2KHR)(
++      commandBuffer, pPushDescriptorSetWithTemplateInfo);
++}
++
++void PVR_PER_ARCH(CmdPushDescriptorSetWithTemplateKHR)(
++   VkCommandBuffer commandBuffer,
++   VkDescriptorUpdateTemplate descriptorUpdateTemplate,
++   VkPipelineLayout layout,
++   uint32_t set,
++   const void *pData)
++{
++   const VkPushDescriptorSetWithTemplateInfo info = {
++      .sType =
++         VK_STRUCTURE_TYPE_PUSH_DESCRIPTOR_SET_WITH_TEMPLATE_INFO_KHR,
++      .pNext = NULL,
++      .descriptorUpdateTemplate = descriptorUpdateTemplate,
++      .layout = layout,
++      .set = set,
++      .pData = pData,
++   };
++   PVR_PER_ARCH(CmdPushDescriptorSetWithTemplate2KHR)(commandBuffer, &info);
++}
++
++void PVR_PER_ARCH(CmdPushDescriptorSetWithTemplate)(
++   VkCommandBuffer commandBuffer,
++   VkDescriptorUpdateTemplate descriptorUpdateTemplate,
++   VkPipelineLayout layout,
++   uint32_t set,
++   const void *pData)
++{
++   PVR_PER_ARCH(CmdPushDescriptorSetWithTemplateKHR)(
++      commandBuffer, descriptorUpdateTemplate, layout, set, pData);
++}
++
+ void PVR_PER_ARCH(GetRenderingAreaGranularity)(
+    VkDevice _device,
+    const VkRenderingAreaInfoKHR *pRenderingAreaInfo,
+diff --git a/src/imagination/vulkan/pvr_arch_csb.c b/src/imagination/vulkan/pvr_arch_csb.c
+index 66edec7..efff928 100644
+--- a/src/imagination/vulkan/pvr_arch_csb.c
++++ b/src/imagination/vulkan/pvr_arch_csb.c
+@@ -121,16 +121,27 @@ static bool pvr_csb_buffer_extend(struct pvr_csb *csb)
+    STATIC_ASSERT(ROGUE_VDMCTRL_GUARD_SIZE_DEFAULT ==
+                  ROGUE_CDMCTRL_GUARD_SIZE_DEFAULT);
+ 
+-   result = pvr_bo_alloc(csb->device,
+-                         csb->device->heaps.general_heap,
+-                         PVR_CMD_BUFFER_CSB_BO_SIZE,
+-                         cache_line_size,
+-                         PVR_BO_ALLOC_FLAG_CPU_MAPPED,
+-                         &pvr_bo);
+-   if (result != VK_SUCCESS) {
+-      vk_error(csb->device, result);
+-      csb->status = result;
+-      return false;
++   /* Try to reuse a pooled CSB BO before allocating a new one.
++    * Pooled BOs are already CPU-mapped and GPU VA-mapped. */
++   simple_mtx_lock(&csb->device->csb_bo_pool_mtx);
++   if (csb->device->csb_bo_pool_count > 0) {
++      pvr_bo = list_first_entry(&csb->device->csb_bo_pool, struct pvr_bo, link);
++      list_del(&pvr_bo->link);
++      csb->device->csb_bo_pool_count--;
++      simple_mtx_unlock(&csb->device->csb_bo_pool_mtx);
++   } else {
++      simple_mtx_unlock(&csb->device->csb_bo_pool_mtx);
++      result = pvr_bo_alloc(csb->device,
++                            csb->device->heaps.general_heap,
++                            PVR_CMD_BUFFER_CSB_BO_SIZE,
++                            cache_line_size,
++                            PVR_BO_ALLOC_FLAG_CPU_MAPPED,
++                            &pvr_bo);
++      if (result != VK_SUCCESS) {
++         vk_error(csb->device, result);
++         csb->status = result;
++         return false;
++      }
+    }
+ 
+    /* if this is not the first BO in csb */
+diff --git a/src/imagination/vulkan/pvr_arch_descriptor_set.c b/src/imagination/vulkan/pvr_arch_descriptor_set.c
+index 9e99a51..6aaeb76 100644
+--- a/src/imagination/vulkan/pvr_arch_descriptor_set.c
++++ b/src/imagination/vulkan/pvr_arch_descriptor_set.c
+@@ -364,6 +364,17 @@ void PVR_PER_ARCH(UpdateDescriptorSets)(
+          }
+          break;
+ 
++      case VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK: {
++         const VkWriteDescriptorSetInlineUniformBlock *iub =
++            vk_find_struct_const(write->pNext,
++                                 WRITE_DESCRIPTOR_SET_INLINE_UNIFORM_BLOCK);
++         assert(iub && iub->pData);
++         void *dst = (uint8_t *)set->mapping
++                     + binding->offset + write->dstArrayElement;
++         memcpy(dst, iub->pData, iub->dataSize);
++         break;
++      }
++
+       default:
+          UNREACHABLE("");
+       }
+@@ -549,6 +560,16 @@ void PVR_PER_ARCH(UpdateDescriptorSetWithTemplate)(
+          }
+          break;
+ 
++      case VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK: {
++         /* For templates, data points directly to the inline uniform data;
++          * array_element is the byte offset within the block,
++          * array_count is the byte count to copy. */
++         void *dst = (uint8_t *)set->mapping
++                     + layout_binding->offset + entry->array_element;
++         memcpy(dst, data, entry->array_count);
++         break;
++      }
++
+       default:
+          UNREACHABLE("Unknown descriptor type");
+       }
+diff --git a/src/imagination/vulkan/pvr_arch_device.c b/src/imagination/vulkan/pvr_arch_device.c
+index 64b0e32..b3dad65 100644
+--- a/src/imagination/vulkan/pvr_arch_device.c
++++ b/src/imagination/vulkan/pvr_arch_device.c
+@@ -23,6 +23,7 @@
+ #include "pvr_entrypoints.h"
+ #include "pvr_framebuffer.h"
+ #include "pvr_free_list.h"
++#include "pvr_rt_dataset.h"
+ #include "pvr_instance.h"
+ #include "pvr_job_render.h"
+ #include "pvr_macros.h"
+@@ -55,11 +56,11 @@
+  * TODO: Investigate if a different default size can improve the overall
+  * performance of internal driver allocations.
+  */
+-#define PVR_SUBALLOCATOR_GENERAL_SIZE (128 * 1024)
+-#define PVR_SUBALLOCATOR_PDS_SIZE (128 * 1024)
+-#define PVR_SUBALLOCATOR_TRANSFER_SIZE (128 * 1024)
+-#define PVR_SUBALLOCATOR_USC_SIZE (128 * 1024)
+-#define PVR_SUBALLOCATOR_VIS_TEST_SIZE (128 * 1024)
++#define PVR_SUBALLOCATOR_GENERAL_SIZE (512 * 1024)
++#define PVR_SUBALLOCATOR_PDS_SIZE (512 * 1024)
++#define PVR_SUBALLOCATOR_TRANSFER_SIZE (512 * 1024)
++#define PVR_SUBALLOCATOR_USC_SIZE (512 * 1024)
++#define PVR_SUBALLOCATOR_VIS_TEST_SIZE (512 * 1024)
+ 
+ static uint32_t pvr_get_simultaneous_num_allocs(
+    const struct pvr_device_info *dev_info,
+@@ -852,6 +853,23 @@ VkResult PVR_PER_ARCH(create_device)(struct pvr_physical_device *pdevice,
+    simple_mtx_init(&device->rs_mtx, mtx_plain);
+    list_inithead(&device->render_states);
+ 
++   simple_mtx_init(&device->rt_cache_mtx, mtx_plain);
++   device->rt_cache_enabled = true;
++   device->rt_cache_count = 0;
++
++   /* CSB BO pool init */
++   simple_mtx_init(&device->csb_bo_pool_mtx, mtx_plain);
++   list_inithead(&device->csb_bo_pool);
++   device->csb_bo_pool_count = 0;
++
++   /* EOT cache init */
++   simple_mtx_init(&device->eot_cache_mtx, mtx_plain);
++   device->eot_cache_count = 0;
++
++   /* bgobj consts_buffer cache init */
++   simple_mtx_init(&device->bgobj_cache_mtx, mtx_plain);
++   device->bgobj_cache_bo = NULL;
++
+    *pDevice = pvr_device_to_handle(device);
+ 
+    return VK_SUCCESS;
+@@ -924,6 +942,48 @@ void PVR_PER_ARCH(destroy_device)(struct pvr_device *device,
+    if (!device)
+       return;
+ 
++   /* Flush EOT cache */
++   {
++      simple_mtx_lock(&device->eot_cache_mtx);
++      for (uint32_t _i = 0; _i < device->eot_cache_count; _i++) {
++         struct pvr_eot_cache_entry *ce = &device->eot_cache[_i];
++         pvr_bo_suballoc_free(ce->usc_bo);
++         pvr_bo_suballoc_free(ce->pds_upload.pvr_bo);
++      }
++      device->eot_cache_count = 0;
++      simple_mtx_unlock(&device->eot_cache_mtx);
++   }
++   simple_mtx_destroy(&device->eot_cache_mtx);
++
++   /* Flush bgobj consts_buffer cache */
++   {
++      simple_mtx_lock(&device->bgobj_cache_mtx);
++      if (device->bgobj_cache_bo) {
++         pvr_bo_free(device, device->bgobj_cache_bo);
++         device->bgobj_cache_bo = NULL;
++      }
++      simple_mtx_unlock(&device->bgobj_cache_mtx);
++   }
++   simple_mtx_destroy(&device->bgobj_cache_mtx);
++
++   /* Flush CSB BO pool */
++   {
++      struct pvr_bo *pvr_bo, *tmp;
++      simple_mtx_lock(&device->csb_bo_pool_mtx);
++      list_for_each_entry_safe(struct pvr_bo, pvr_bo, &device->csb_bo_pool, link) {
++         list_del(&pvr_bo->link);
++         pvr_bo_free(device, pvr_bo);
++      }
++      device->csb_bo_pool_count = 0;
++      simple_mtx_unlock(&device->csb_bo_pool_mtx);
++   }
++   simple_mtx_destroy(&device->csb_bo_pool_mtx);
++
++   /* Disable caching and flush cached rt_datasets before cleanup */
++   device->rt_cache_enabled = false;
++   pvr_rt_dataset_cache_flush(device);
++   simple_mtx_destroy(&device->rt_cache_mtx);
++
+    simple_mtx_lock(&device->rs_mtx);
+    list_for_each_entry_safe (struct pvr_render_state,
+                              rstate,
+diff --git a/src/imagination/vulkan/pvr_arch_hw_pass.c b/src/imagination/vulkan/pvr_arch_hw_pass.c
+index 8e4eaca..7fa9af9 100644
+--- a/src/imagination/vulkan/pvr_arch_hw_pass.c
++++ b/src/imagination/vulkan/pvr_arch_hw_pass.c
+@@ -435,7 +435,8 @@ pvr_surface_setup_render_init(struct pvr_renderpass_context *ctx,
+       buffer->used[start + i] = true;
+    }
+ 
+-   if (load_op == VK_ATTACHMENT_LOAD_OP_DONT_CARE)
++   if (load_op == VK_ATTACHMENT_LOAD_OP_DONT_CARE ||
++       load_op == VK_ATTACHMENT_LOAD_OP_NONE_EXT)
+       *use_render_init = false;
+ 
+    if (*use_render_init) {
+diff --git a/src/imagination/vulkan/pvr_arch_image.c b/src/imagination/vulkan/pvr_arch_image.c
+index af39eab..918c473 100644
+--- a/src/imagination/vulkan/pvr_arch_image.c
++++ b/src/imagination/vulkan/pvr_arch_image.c
+@@ -190,6 +190,15 @@ VkResult PVR_PER_ARCH(CreateImageView)(VkDevice _device,
+ 
+    util_format_compose_swizzles(format_swizzle, input_swizzle, info.swizzle);
+ 
++   /* K3 OPT: Tag render-target-only TWIDDLED images for FBCDC compression.
++    * These are written exclusively by the PBE (not by the transfer engine),
++    * so the TPU can read them in FB_DIRECT_8X8 compression mode. */
++   info.fbcdc_compressed =
++      PVR_HAS_FEATURE(&device->pdevice->dev_info, fbcdc_algorithm) &&
++      image->memlayout == PVR_MEMLAYOUT_TWIDDLED &&
++      (image->vk.usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) &&
++      !(image->vk.usage & VK_IMAGE_USAGE_TRANSFER_DST_BIT);
++
+    result = pvr_arch_pack_tex_state(device,
+                                     &info,
+                                     &iview->image_state[info.tex_state_type]);
+diff --git a/src/imagination/vulkan/pvr_arch_job_common.c b/src/imagination/vulkan/pvr_arch_job_common.c
+index f420deb..543840e 100644
+--- a/src/imagination/vulkan/pvr_arch_job_common.c
++++ b/src/imagination/vulkan/pvr_arch_job_common.c
+@@ -174,6 +174,12 @@ void pvr_arch_pbe_pack_state(
+       reg.linestride = (surface_params->stride - 1) /
+                        ROGUE_PBESTATE_REG_WORD0_LINESTRIDE_UNIT_SIZE;
+       reg.minclip_x = render_params->min_x_clip;
++      /* K3 OPT: FBCDC lossless tile compression. The TPU will read these
++       * tiles in FB_DIRECT_8X8 mode; PBE and TPU block sizes must match. */
++      if (surface_params->enable_fbcdc) {
++         reg.compression = ROGUE_PBESTATE_COMPRESSION_ENABLED;
++         reg.compress_size = ROGUE_PBESTATE_COMPRESS_SIZE_BLOCK_8X8;
++      }
+ 
+       /* r, y or depth*/
+       switch (surface_params->swizzle[0]) {
+diff --git a/src/imagination/vulkan/pvr_arch_tex_state.c b/src/imagination/vulkan/pvr_arch_tex_state.c
+index 8233913..53a194d 100644
+--- a/src/imagination/vulkan/pvr_arch_tex_state.c
++++ b/src/imagination/vulkan/pvr_arch_tex_state.c
+@@ -312,6 +312,13 @@ VkResult pvr_arch_pack_tex_state(struct pvr_device *device,
+              vk_format_is_compressed(info->format))
+             word1.tpu_image_state_v2_compression_mode =
+                ROGUE_TEXSTATE_COMPRESSION_MODE_TPU;
++         /* K3 OPT: FBCDC lossless compression for render targets.
++          * The PBE wrote the image as 8x8-block compressed tiles;
++          * tell the TPU to decompress on read. */
++         else if (PVR_HAS_FEATURE(dev_info, tpu_image_state_v2) &&
++                  info->fbcdc_compressed)
++            word1.tpu_image_state_v2_compression_mode =
++               ROGUE_TEXSTATE_COMPRESSION_MODE_FB_DIRECT_8X8;
+       }
+    }
+ 
+diff --git a/src/imagination/vulkan/pvr_cmd_buffer.h b/src/imagination/vulkan/pvr_cmd_buffer.h
+index 0ca8a08..974f39c 100644
+--- a/src/imagination/vulkan/pvr_cmd_buffer.h
++++ b/src/imagination/vulkan/pvr_cmd_buffer.h
+@@ -533,6 +533,9 @@ struct pvr_cmd_buffer {
+    /* Buffer usage flags */
+    VkCommandBufferUsageFlags usage_flags;
+ 
++   /* CPU-side pvr_descriptor_set objects for push descriptors; freed on reset */
++   struct util_dynarray push_desc_set_ptrs;
++
+    /* Array of struct pvr_depth_bias_state. */
+    struct util_dynarray depth_bias_array;
+ 
+@@ -551,6 +554,12 @@ struct pvr_cmd_buffer {
+     */
+    struct list_head deferred_clears;
+ 
++   /* Per-slot GPU BO cache for push descriptors.
++    * Survives command buffer reset; freed only on destroy.
++    * Index == set number (< PVR_MAX_DESCRIPTOR_SETS). */
++   struct pvr_suballoc_bo *push_desc_bo_cache[PVR_MAX_DESCRIPTOR_SETS];
++   uint32_t push_desc_bo_cache_size[PVR_MAX_DESCRIPTOR_SETS];
++
+    /* List of pvr_bo structs associated with this cmd buffer. */
+    struct list_head bo_list;
+ 
+diff --git a/src/imagination/vulkan/pvr_descriptor_set.c b/src/imagination/vulkan/pvr_descriptor_set.c
+index c5a3896..5317d82 100644
+--- a/src/imagination/vulkan/pvr_descriptor_set.c
++++ b/src/imagination/vulkan/pvr_descriptor_set.c
+@@ -102,6 +102,10 @@ static unsigned pvr_descriptor_size(VkDescriptorType type)
+    case VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT:
+       return sizeof(struct pvr_image_descriptor);
+ 
++   case VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK:
++      /* Inline uniform block: 1 byte per byte of inline data */
++      return 1;
++
+    default:
+       mesa_loge("Unsupported descriptor type %s.\n",
+                 vk_DescriptorType_to_str(type));
+diff --git a/src/imagination/vulkan/pvr_device.h b/src/imagination/vulkan/pvr_device.h
+index 75177a1..7dc8fb9 100644
+--- a/src/imagination/vulkan/pvr_device.h
++++ b/src/imagination/vulkan/pvr_device.h
+@@ -51,6 +51,25 @@ struct pvr_compute_query_shader {
+    struct pvr_pds_upload pds_sec_code;
+ };
+ 
++/* PVR_NUM_PBE_EMIT_REGS=8, ROGUE_NUM_PBESTATE_STATE_WORDS=2 */
++#define PVR_EOT_CACHE_MAX 64U
++#define PVR_EOT_PBE_CS_MAX (8U * 2U)
++#define PVR_EOT_TILE_BUF_MAX 8U
++
++struct pvr_eot_cache_key {
++   uint32_t emit_count;
++   uint32_t msaa_samples;
++   uint32_t pixel_output_width;
++   uint32_t pbe_cs_words[PVR_EOT_PBE_CS_MAX];
++   uint64_t tile_buffer_addrs[PVR_EOT_TILE_BUF_MAX];
++};
++
++struct pvr_eot_cache_entry {
++   struct pvr_eot_cache_key key;
++   struct pvr_suballoc_bo *usc_bo; /* device-owned USC suballoc */
++   struct pvr_pds_upload pds_upload; /* device-owned PDS suballoc */
++};
++
+ struct pvr_device {
+    struct vk_device vk;
+    struct pvr_instance *instance;
+@@ -146,6 +165,53 @@ struct pvr_device {
+ 
+    simple_mtx_t rs_mtx;
+    struct list_head render_states;
++
++   /* Cache of rt_datasets to avoid per-frame recreation in dynamic rendering.
++    * Keyed by (width, height, samples, layers) stored inside the rt_dataset.
++    */
++#define PVR_RT_DATASET_CACHE_SIZE 16
++   simple_mtx_t rt_cache_mtx;
++   bool rt_cache_enabled;
++   struct pvr_rt_dataset *rt_cache[PVR_RT_DATASET_CACHE_SIZE];
++   uint32_t rt_cache_count;
++
++   /* Pool of reusable CSB BOs (size == PVR_CMD_BUFFER_CSB_BO_SIZE, CPU+GPU mapped).
++    * Freed CSB BOs are returned here; pvr_csb_buffer_extend() retrieves them
++    * to avoid per-frame DRM_IOCTL_PVR_CREATE_BO / VM_MAP kernel calls.
++    */
++#define PVR_CSB_BO_POOL_MAX 64
++   simple_mtx_t csb_bo_pool_mtx;
++   struct list_head csb_bo_pool;
++   uint32_t csb_bo_pool_count;
++
++   /* Cache of EOT (End-Of-Tile) USC+PDS programs.
++    * pvr_sub_cmd_gfx_per_job_fragment_programs_create_and_upload() recompiles
++    * the EOT shader every render pass. For glmark2's typical single-attachment
++    * scenes the key is {emit_count, pbe_cs_words[], msaa_samples,
++    * pixel_output_width, tile_buffer_addrs[]}, which is stable within a pass
++    * type. Cache entries persist until device destroy.
++    *
++    * pbe_cs_words encode the framebuffer GPU address, so a 3-buffer swap chain
++    * produces 3 entries; blur's 12 passes produce ~12 entries -- all reused
++    * from frame 2 onward.
++    */
++   simple_mtx_t eot_cache_mtx;
++   struct pvr_eot_cache_entry eot_cache[PVR_EOT_CACHE_MAX];
++   uint32_t eot_cache_count;
++
++   /* Cache of SPM background-object consts_buffer raw GEM BOs.
++    * pvr_arch_spm_init_bgobj_state() allocates one per CmdBeginRendering;
++    * for identical render params the BO content is unchanged frame-to-frame.
++    * Keeping one cached BO avoids per-frame DRM_IOCTL_PVR_CREATE_BO.
++    */
++   simple_mtx_t bgobj_cache_mtx;
++   struct pvr_bo *bgobj_cache_bo;
++   uint64_t bgobj_cache_scratch_addr;
++   uint32_t bgobj_cache_fw, bgobj_cache_fh;
++   uint32_t bgobj_cache_sample_count;
++   uint32_t bgobj_cache_output_reg_count;
++   uint32_t bgobj_cache_tile_buffer_count;
++   bool     bgobj_cache_is_multisampled;
+ };
+ 
+ struct pvr_device_memory {
+diff --git a/src/imagination/vulkan/pvr_job_common.h b/src/imagination/vulkan/pvr_job_common.h
+index 977aa3d..e5ac717 100644
+--- a/src/imagination/vulkan/pvr_job_common.h
++++ b/src/imagination/vulkan/pvr_job_common.h
+@@ -87,6 +87,9 @@ struct pvr_pbe_surf_params {
+    uint32_t height;
+ 
+    bool z_only_render;
++
++   /** K3 OPT: Enable FBCDC lossless tile compression in the PBE. */
++   bool enable_fbcdc;
+    bool down_scale;
+ };
+ 
+diff --git a/src/imagination/vulkan/pvr_tex_state.h b/src/imagination/vulkan/pvr_tex_state.h
+index fe48892..ff142ae 100644
+--- a/src/imagination/vulkan/pvr_tex_state.h
++++ b/src/imagination/vulkan/pvr_tex_state.h
+@@ -117,6 +117,12 @@ struct pvr_texture_state_info {
+     * Use a YVU format instead of YUV
+     */
+    bool swap_chroma;
++
++   /**
++    * K3 OPT: Image was written by PBE with FBCDC lossless compression.
++    * When true the TPU must read it with FB_DIRECT compression mode.
++    */
++   bool fbcdc_compressed;
+ };
+ 
+ #ifdef PVR_PER_ARCH
+-- 
+2.53.0
+

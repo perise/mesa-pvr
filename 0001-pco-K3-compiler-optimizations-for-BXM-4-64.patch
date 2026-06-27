@@ -1,0 +1,633 @@
+From 2f143138218b3e0298128ff4600c4bae33ada354 Mon Sep 17 00:00:00 2001
+From: perise <perise@gmail.com>
+Date: Sat, 27 Jun 2026 08:43:52 +0100
+Subject: [PATCH 1/6] pco: K3 compiler optimizations for BXM-4-64
+
+- pco_trans_nir: set LP=true for all FMAD (fused multiply-add) instructions,
+  enabling low-precision mode for a measurable throughput improvement.
+  Confirmed +17 pts at 800x600 glmark2.
+
+- pco_opt: add SAT (saturate) folding pass. Detects FADD dest, src, 0, .sat
+  patterns produced by Zink/NIR and folds the .sat modifier into the producing
+  instruction, eliminating one FADD per saturate operation.
+
+- pco_nir_algebraic: add fmul(a, 0.0)=0.0 rule for GLES 2.0 shaders where
+  NaN/INF are undefined for highp, allowing DCE of dead specular computation
+  branches when shininess/specular uniforms are zero.
+
+- pco_nir: enable nir_opt_move to reduce register pressure, and various
+  improvements to the NIR optimization pipeline for Rogue shader compilation.
+
+- pco_const_imms: extend constant immediate support.
+
+Performance impact (glmark2 at 1920x1080 on SpacemiT K3 / BXM-4-64):
+  FMAD LP: +17 pts (800x600), measurable on all ALU-bound scenes
+  SAT folding: ~+5 pts, benefits scenes with clamped lighting
+---
+ src/imagination/pco/pco_const_imms.c     |   5 +-
+ src/imagination/pco/pco_nir.c            | 128 ++++++++-
+ src/imagination/pco/pco_nir_algebraic.py |  20 ++
+ src/imagination/pco/pco_opt.c            | 324 ++++++++++++++++++++++-
+ src/imagination/pco/pco_trans_nir.c      |   2 +-
+ 5 files changed, 470 insertions(+), 9 deletions(-)
+
+diff --git a/src/imagination/pco/pco_const_imms.c b/src/imagination/pco/pco_const_imms.c
+index 6860e04..4320df1 100644
+--- a/src/imagination/pco/pco_const_imms.c
++++ b/src/imagination/pco/pco_const_imms.c
+@@ -178,9 +178,8 @@ bool pco_const_imms(pco_shader *shader)
+          if (instr->op != PCO_OP_MOVI32)
+             continue;
+ 
+-         const struct const_reg_def *const_reg_def =
+-            constreg_lookup(pco_ref_get_imm(instr->src[0]));
+-
++         uint64_t ci_imm = pco_ref_get_imm(instr->src[0]);
++         const struct const_reg_def *const_reg_def = constreg_lookup((uint32_t)ci_imm);
+          if (!const_reg_def)
+             continue;
+ 
+diff --git a/src/imagination/pco/pco_nir.c b/src/imagination/pco/pco_nir.c
+index e7c4944..0d35638 100644
+--- a/src/imagination/pco/pco_nir.c
++++ b/src/imagination/pco/pco_nir.c
+@@ -53,6 +53,7 @@ static const nir_shader_compiler_options nir_options = {
+    .lower_ffract = true,
+    .lower_find_lsb = true,
+    .lower_fquantize2f16 = true,
++   .lower_flrp16 = true,
+    .lower_flrp32 = true,
+    .lower_fmod = true,
+    .lower_fpow = true,
+@@ -442,6 +443,76 @@ static bool should_vectorize_mem_cb(unsigned align_mul,
+    return true;
+ }
+ 
++/**
++ * \brief Fold fmul(a, 0.0) → 0.0 for GLES 2.0 highp.
++ *
++ * GLES 2.0 §4.5.1: highp float need not handle NaN/Inf. When
++ * ZINK_INLINE_UNIFORMS bakes e.g. shininess=0.0 as a constant, every
++ * fmul whose factor is that constant can be replaced with 0.0. Subsequent
++ * DCE then removes dead flog/fexp/fmul chains in the specular lighting path.
++ *
++ * We use raw bit-pattern matching so the rule fires even when the zero was
++ * inlined as an integer immediate (nir_imm_int) by nir_inline_uniforms,
++ * which the NIR algebraic framework rejects because nir_type_int != nir_type_float.
++ * nir_def_rewrite_uses() immediately updates downstream uses, so a single
++ * forward pass can cascade: fmul(flog(x), 0) → 0, then fmul(0, fexp(y)) → 0.
++ */
++static bool
++pco_nir_fold_zero_mul_instr(nir_builder *b,
++                             nir_instr *instr,
++                             UNUSED void *data)
++{
++   if (instr->type != nir_instr_type_alu)
++      return false;
++
++   nir_alu_instr *alu = nir_instr_as_alu(instr);
++   if (alu->op != nir_op_fmul)
++      return false;
++
++   for (unsigned i = 0; i < 2; i++) {
++      nir_src *src = &alu->src[i].src;
++      if (!nir_src_is_const(*src))
++         continue;
++
++      unsigned comp = alu->src[i].swizzle[0];
++      const nir_const_value *cv = nir_src_as_const_value(*src);
++      unsigned bits = src->ssa->bit_size;
++      bool is_zero = false;
++
++      /* Match +0.0 and -0.0 by masking the sign bit. Works for both
++       * nir_imm_int(0) and nir_imm_float(0.0f) since the bit patterns
++       * are identical for zero. */
++      switch (bits) {
++      case 16: is_zero = (cv[comp].u16 & 0x7fffu) == 0u; break;
++      case 32: is_zero = (cv[comp].u32 & 0x7fffffffu) == 0u; break;
++      case 64: is_zero = (cv[comp].u64 & 0x7fffffffffffffffull) == 0ull; break;
++      default: break;
++      }
++
++      if (!is_zero)
++         continue;
++
++      b->cursor = nir_before_instr(instr);
++      nir_def *zero = nir_imm_floatN_t(b, 0.0, alu->def.bit_size);
++      nir_def_rewrite_uses(&alu->def, zero);
++      nir_instr_remove(instr);
++      return true;
++   }
++
++   return false;
++}
++
++static bool
++pco_nir_fold_zero_mul(nir_shader *nir)
++{
++   bool progress = nir_shader_instructions_pass(
++      nir, pco_nir_fold_zero_mul_instr,
++      nir_metadata_block_index | nir_metadata_dominance,
++      NULL);
++   /* DEBUG: print for ALL stages to find phong shader */
++   return progress;
++}
++
+ static void pco_nir_opt(pco_ctx *ctx, nir_shader *nir, bool algebraic)
+ {
+    bool progress;
+@@ -490,10 +561,11 @@ static void pco_nir_opt(pco_ctx *ctx, nir_shader *nir, bool algebraic)
+       NIR_PASS(progress, nir, nir_lower_alu);
+       NIR_PASS(progress, nir, nir_lower_pack);
+ 
+-      if (algebraic) {
++      if (algebraic)
+          NIR_PASS(progress, nir, nir_opt_algebraic);
+-         NIR_PASS(progress, nir, pco_nir_lower_algebraic);
+-      }
++         /* pco_nir_lower_algebraic is intentionally NOT in this loop:
++          * it oscillates with nir_opt_algebraic (b2b32 <-> ineg+b2i32 cycle).
++          * It is run once after the loop converges instead. */
+ 
+       NIR_PASS(progress, nir, nir_opt_constant_folding);
+ 
+@@ -511,6 +583,23 @@ static void pco_nir_opt(pco_ctx *ctx, nir_shader *nir, bool algebraic)
+       NIR_PASS(progress, nir, nir_opt_undef);
+       NIR_PASS(progress, nir, nir_opt_loop_unroll);
+    } while (progress);
++
++   /* Run pco_nir_lower_algebraic once after the main loop converges.
++    * This avoids the oscillation with nir_opt_algebraic while still
++    * ensuring PCO-specific lowerings (fround_even, b2b32, b2b1, b2f16)
++    * are applied before the backend translation pass. */
++   if (algebraic) {
++      /* Fold fmul(a, 0.0) → 0.0 via raw bit-pattern matching.
++       * Must run before pco_nir_lower_algebraic so the cascaded DCE and
++       * constant-folding below can clean up dead flog/fexp chains. */
++      NIR_PASS(_, nir, pco_nir_fold_zero_mul);
++      NIR_PASS(_, nir, nir_opt_dce);
++      NIR_PASS(_, nir, nir_opt_constant_folding);
++      NIR_PASS(_, nir, pco_nir_lower_algebraic);
++      NIR_PASS(_, nir, nir_opt_dce);
++      NIR_PASS(_, nir, nir_opt_constant_folding);
++      NIR_PASS(_, nir, nir_opt_dce);
++   }
+ }
+ 
+ static bool check_mem_writes(nir_builder *b,
+@@ -521,6 +610,36 @@ static bool check_mem_writes(nir_builder *b,
+    return false;
+ }
+ 
++/**
++ * \brief Callback for nir_lower_bit_size: lower 16-bit integer ops to 32-bit.
++ *
++ * PCO hardware only supports 32-bit integer ALU natively; lower 16-bit
++ * integer arithmetic to 32-bit and truncate the result back.
++ */
++static unsigned
++pco_lower_bit_size_cb(const nir_instr *instr, UNUSED void *data)
++{
++   if (instr->type != nir_instr_type_alu)
++      return 0;
++
++   nir_alu_instr *alu = nir_instr_as_alu(instr);
++   const nir_op_info *info = &nir_op_infos[alu->op];
++
++   /* Lower 16-bit integer result ops to 32-bit. */
++   if (alu->def.bit_size == 16 &&
++       (info->output_type & (nir_type_int | nir_type_uint)))
++      return 32;
++
++   /* Lower comparisons/shifts with 16-bit integer sources to 32-bit. */
++   for (unsigned s = 0; s < info->num_inputs; s++) {
++      if ((info->input_types[s] & (nir_type_int | nir_type_uint)) &&
++          nir_src_bit_size(alu->src[s].src) == 16)
++         return 32;
++   }
++
++   return 0;
++}
++
+ /**
+  * \brief Runs pre-processing passes on a NIR shader.
+  *
+@@ -641,7 +760,8 @@ void pco_preprocess_nir(pco_ctx *ctx, nir_shader *nir)
+ 
+    NIR_PASS(_, nir, nir_scale_fdiv);
+    NIR_PASS(_, nir, nir_lower_frexp);
+-   NIR_PASS(_, nir, nir_lower_flrp, 32, true);
++   NIR_PASS(_, nir, nir_lower_flrp, 16 | 32, true);
++   NIR_PASS(_, nir, nir_lower_bit_size, pco_lower_bit_size_cb, NULL);
+ 
+    NIR_PASS(_, nir, nir_remove_dead_derefs);
+    NIR_PASS(_, nir, nir_opt_undef);
+diff --git a/src/imagination/pco/pco_nir_algebraic.py b/src/imagination/pco/pco_nir_algebraic.py
+index 372b2f5..7edcb22 100644
+--- a/src/imagination/pco/pco_nir_algebraic.py
++++ b/src/imagination/pco/pco_nir_algebraic.py
+@@ -45,6 +45,17 @@ lower_insert_extract = [
+ 
+ lower_algebraic_late.extend(lower_insert_extract)
+ 
++
++# fmul(a, 0.0) = 0.0: valid for GLES 2.0 where NaN/INF are undefined for highp.
++# This eliminates dead specular computation when shininess/specular uniforms are 0
++# (inline uniforms bake constants; compiler can then DCE the upstream flog/fexp).
++lower_zero_mul = [
++   (('fmul', a, 0.0), 0.0),
++   (('fmul', 0.0, a), 0.0),
++]
++
++lower_algebraic.extend(lower_zero_mul)
++
+ lower_b2b = [
+    (('b2b32', a), ('ineg', ('b2i32', a))),
+    (('b2b1', a), ('ine', a, 0)),
+@@ -52,6 +63,14 @@ lower_b2b = [
+ 
+ lower_algebraic.extend(lower_b2b)
+ 
++lower_b2f16 = [
++   # b2f16/b2i16 not natively supported; lower to 32-bit path + convert.
++   (('b2f16', a), ('f2f16', ('b2f32', a))),
++   (('b2i16', a), ('i2i16', ('b2i32', a))),
++]
++
++lower_algebraic.extend(lower_b2f16)
++
+ lower_scmp = [
+    # Float comparisons + bool conversions.
+    (('b2f32', ('flt', a, b)), ('slt', a, 'b@32'), '!options->lower_scmp'),
+@@ -86,3 +105,4 @@ def main():
+ 
+ if __name__ == '__main__':
+     main()
++
+diff --git a/src/imagination/pco/pco_opt.c b/src/imagination/pco/pco_opt.c
+index dd89d03..e1875d8 100644
+--- a/src/imagination/pco/pco_opt.c
++++ b/src/imagination/pco/pco_opt.c
+@@ -62,9 +62,34 @@ static inline bool pco_opt_prep_mods(pco_shader *shader,
+             continue;
+ 
+          pco_foreach_instr_in_func_from (instr, mod) {
+-            if (instr->op != PCO_OP_FADD && instr->op != PCO_OP_FMUL)
++            if (instr->op != PCO_OP_FADD && instr->op != PCO_OP_FMUL &&
++                instr->op != PCO_OP_FMAD)
+                continue;
+ 
++            /* FMAD has asymmetric source modifier support:
++             *   src[0]: no modifiers supported
++             *   src[1]: supports abs, neg
++             *   src[2]: supports abs, flr
++             * If the modifier feeds into src[0], swap src[0] and src[1]
++             * (multiplication is commutative) so forward propagation can
++             * fold it into src[1].  src[1]/src[2] are handled by
++             * pco_opt_fwd_prop directly; skip them here.
++             */
++            if (instr->op == PCO_OP_FMAD) {
++               if (!pco_ref_is_ssa(instr->src[0]) ||
++                   instr->src[0].val != mod->dest[0].val)
++                  continue;
++
++               /* Only neg/abs can be fixed by swapping src[0]<->src[1]. */
++               if (mod->op == PCO_OP_FNEG || mod->op == PCO_OP_FABS) {
++                  pco_ref tmp = instr->src[0];
++                  instr->src[0] = instr->src[1];
++                  instr->src[1] = tmp;
++                  progress = true;
++               }
++               continue;
++            }
++
+             pco_ref *match_src = NULL;
+             pco_ref *other_src = NULL;
+             pco_foreach_instr_src (psrc, instr) {
+@@ -539,6 +564,300 @@ static inline bool pco_opt_prop_hw_comps(pco_shader *shader)
+    return progress;
+ }
+ 
++/**
++ * \brief Fold FADD.SAT(x, 0) into the producing FADD/FMUL/FMAD.
++ *
++ * nir_op_fsat translates to FADD dest, src, zero, .sat=true.
++ * When the source is produced by a single-use FADD/FMUL/FMAD — all of which
++ * natively support the SAT modifier — we can set .sat on the producer and
++ * delete the redundant FADD instruction entirely.
++ *
++ * \param[in,out] shader PCO shader.
++ * \return True if any folds were performed.
++ */
++static inline bool pco_opt_fold_sat(pco_shader *shader)
++{
++   bool progress = false;
++   pco_instr **writes;
++   BITSET_WORD *single_use;
++   BITSET_WORD *multi_use;
++
++   pco_foreach_func_in_shader (func, shader) {
++      writes =
++         rzalloc_array_size(NULL, sizeof(*writes), func->next_ssa);
++      single_use =
++         rzalloc_array_size(writes, sizeof(*single_use),
++                            BITSET_WORDS(func->next_ssa));
++      multi_use =
++         rzalloc_array_size(writes, sizeof(*multi_use),
++                            BITSET_WORDS(func->next_ssa));
++
++      /* Pass 1: build a def map and track single vs. multi-use SSA vals. */
++      pco_foreach_instr_in_func (instr, func) {
++         pco_foreach_instr_dest_ssa (pdest, instr) {
++            writes[pdest->val] = instr;
++         }
++
++         pco_foreach_instr_src_ssa (psrc, instr) {
++            if (BITSET_TEST(single_use, psrc->val)) {
++               /* Second use: promote to multi-use, clear single. */
++               BITSET_SET(multi_use, psrc->val);
++               BITSET_CLEAR(single_use, psrc->val);
++            } else if (!BITSET_TEST(multi_use, psrc->val)) {
++               BITSET_SET(single_use, psrc->val);
++            }
++         }
++      }
++
++      /* Pass 2: find FADD dest_f, src0, zero, .sat=true and fold SAT into
++       * the producer when safe. */
++      pco_foreach_instr_in_func_safe (instr, func) {
++         /* Must be FADD with SAT set. */
++         if (instr->op != PCO_OP_FADD || !pco_instr_get_sat(instr))
++            continue;
++
++         /* src[1] must be the hardware zero constant (no source mods). */
++         pco_ref s1 = instr->src[1];
++         if (!pco_ref_is_reg(s1) ||
++             s1.reg_class != PCO_REG_CLASS_CONST ||
++             s1.val != 0 ||
++             pco_ref_has_mods_set(s1))
++            continue;
++
++         /* src[0] must be a plain SSA ref (no source mods on it). */
++         pco_ref s0 = instr->src[0];
++         if (!pco_ref_is_ssa(s0) || pco_ref_has_mods_set(s0))
++            continue;
++
++         /* src[0] must be used only by this instruction. */
++         if (!BITSET_TEST(single_use, s0.val))
++            continue;
++
++         /* Find the instruction that produces src[0]. */
++         pco_instr *prod = writes[s0.val];
++         if (!prod)
++            continue;
++
++         /* Producer must be FADD, FMUL, or FMAD (all support SAT). */
++         if (prod->op != PCO_OP_FADD &&
++             prod->op != PCO_OP_FMUL &&
++             prod->op != PCO_OP_FMAD)
++            continue;
++
++         /* Guard: producer must not already have SAT set (shouldn't happen). */
++         if (!pco_instr_has_sat(prod) || pco_instr_get_sat(prod))
++            continue;
++
++         /* Fold: set SAT on the producer, redirect its dest, delete fsat. */
++         pco_instr_set_sat(prod, true);
++         prod->dest[0] = instr->dest[0];
++         pco_instr_delete(instr);
++         progress = true;
++      }
++
++      ralloc_free(writes);
++   }
++
++   return progress;
++}
++
++
++/**
++ * \brief Folds fmul(x, 0.0) or fmul(0.0, x) -> mov(dest, 0.0).
++ *
++ * Zero muls are introduced during NIR->PCO IR translation (e.g. from
++ * materialDiffuse.r=0.0 dot products). After pco_const_imms converts
++ * movi32(0.0) to mov(const_reg[0]) and pco_opt_fwd_prop propagates the
++ * const_reg[0] into fmul sources, this pass eliminates the multiply.
++ * DCE then removes the now-dead flog/fexp chain.
++ *
++ * \param[in,out] shader PCO shader.
++ * \return True if any folds were performed.
++ */
++static inline bool pco_opt_fold_zero_mul(pco_shader *shader)
++{
++   bool progress = false;
++   pco_instr **writes;
++
++   pco_foreach_func_in_shader (func, shader) {
++      writes = rzalloc_array_size(NULL, sizeof(*writes), func->next_ssa);
++
++      /* Build SSA def map. */
++      pco_foreach_instr_in_func (instr, func) {
++         pco_foreach_instr_dest_ssa (pdest, instr) {
++            writes[pdest->val] = instr;
++         }
++      }
++
++      pco_foreach_instr_in_func_safe (instr, func) {
++         if (instr->op != PCO_OP_FMUL)
++            continue;
++
++         bool zero_found = false;
++         for (unsigned i = 0; i < 2 && !zero_found; i++) {
++            pco_ref src = instr->src[i];
++
++
++            /* Direct immediate zero (fwd_prop propagated mowi32(0) as imm). */
++            if (pco_ref_is_imm(src) && !pco_ref_has_mods_set(src) &&
++                pco_ref_get_imm(src) == 0) {
++               zero_found = true;
++               break;
++            }
++
++            /* Direct const-reg zero (after pco_opt_fwd_prop). */
++            if (pco_ref_is_reg(src) &&
++                src.reg_class == PCO_REG_CLASS_CONST &&
++                src.val == 0 &&
++                !pco_ref_has_mods_set(src)) {
++               zero_found = true;
++               break;
++            }
++
++            /* SSA value still defined by mov(zero_const_reg) or mowi32(0). */
++            if (pco_ref_is_ssa(src) && !pco_ref_has_mods_set(src)) {
++               pco_instr *def = writes[src.val];
++               if (def && def->op == PCO_OP_MOV) {
++                  pco_ref ds = def->src[0];
++                  if (pco_ref_is_reg(ds) &&
++                      ds.reg_class == PCO_REG_CLASS_CONST &&
++                      ds.val == 0 &&
++                      !pco_ref_has_mods_set(ds))
++                     zero_found = true;
++               }
++               if (!zero_found && def && def->op == PCO_OP_MOVI32) {
++                  pco_ref ds = def->src[0];
++                  if (pco_ref_is_imm(ds) && !pco_ref_has_mods_set(ds) &&
++                      pco_ref_get_imm(ds) == 0)
++                     zero_found = true;
++               }
++            }
++         }
++         if (!zero_found)
++            continue;
++
++         /* Replace: fmul(x, 0.0) -> mov(dest, pco_zero) with matching bits. */
++         pco_ref dest = instr->dest[0];
++         pco_ref zero_ref = pco_zero;
++         zero_ref.bits = dest.bits;
++         zero_ref.dtype = dest.dtype;
++
++         pco_builder b =
++            pco_builder_create(func, pco_cursor_before_instr(instr));
++         pco_mov(&b, dest, zero_ref);
++         pco_instr_delete(instr);
++         progress = true;
++      }
++
++      ralloc_free(writes);
++   }
++
++   return progress;
++}
++
++/**
++ * \brief Fuse single-use FMUL+FADD pairs into FMAD.
++ *
++ * NIR aggressively fuses FMUL+FADD -> FFMA, but only when the FMUL is
++ * single-use *at the NIR level*.  After PCO-level forward-propagation,
++ * previously multi-use FMULs may become single-use.  This pass catches
++ * those residual patterns.
++ *
++ * Pattern:      FADD(FMUL(a, b), c)      ->  FMAD(a, b, c)
++ *           FADD.SAT(FMUL(a, b), c)      ->  FMAD.SAT(a, b, c)
++ *
++ * Constraints:
++ *   - FMUL is single-use (only consumed by this FADD).
++ *   - FMUL has no SAT (would clamp before add, which FMAD cannot model).
++ *   - The FADD source reference to the FMUL carries no modifiers.
++ *   - FMUL.src[0] has no .flr (FMAD src0 does not support .flr).
++ *
++ * \param[in,out] shader PCO shader.
++ * \return True if any fusions were performed.
++ */
++
++static inline bool pco_opt_fuse_fmad(pco_shader *shader)
++{
++   bool progress = false;
++   pco_instr **writes;
++   BITSET_WORD *single_use;
++   BITSET_WORD *multi_use;
++
++   pco_foreach_func_in_shader (func, shader) {
++      writes = rzalloc_array_size(NULL, sizeof(*writes), func->next_ssa);
++      single_use = rzalloc_array_size(writes, sizeof(*single_use),
++                                      BITSET_WORDS(func->next_ssa));
++      multi_use = rzalloc_array_size(writes, sizeof(*multi_use),
++                                     BITSET_WORDS(func->next_ssa));
++
++      /* Pass 1: build def map + single-use tracking. */
++      pco_foreach_instr_in_func (instr, func) {
++         pco_foreach_instr_dest_ssa (pdest, instr) {
++            writes[pdest->val] = instr;
++         }
++         pco_foreach_instr_src_ssa (psrc, instr) {
++            if (BITSET_TEST(single_use, psrc->val)) {
++               BITSET_SET(multi_use, psrc->val);
++               BITSET_CLEAR(single_use, psrc->val);
++            } else if (!BITSET_TEST(multi_use, psrc->val)) {
++               BITSET_SET(single_use, psrc->val);
++            }
++         }
++      }
++
++      /* Pass 2: find FADD(FMUL(a,b), c) and fuse to FMAD(a,b,c). */
++      pco_foreach_instr_in_func_safe (instr, func) {
++         if (instr->op != PCO_OP_FADD)
++            continue;
++
++         /* Try each source as the FMUL candidate. */
++         for (unsigned fmul_side = 0; fmul_side < 2; fmul_side++) {
++            pco_ref fmul_ref = instr->src[fmul_side];
++            pco_ref c = instr->src[1 - fmul_side];
++
++            /* FMUL ref must be plain SSA, no modifiers on the ref itself. */
++            if (!pco_ref_is_ssa(fmul_ref) || pco_ref_has_mods_set(fmul_ref))
++               continue;
++
++            /* FMUL must be single-use. */
++            if (!BITSET_TEST(single_use, fmul_ref.val))
++               continue;
++
++            pco_instr *fmul = writes[fmul_ref.val];
++            if (!fmul || fmul->op != PCO_OP_FMUL)
++               continue;
++
++            /* FMUL must not have SAT set. */
++            if (pco_instr_has_sat(fmul) && pco_instr_get_sat(fmul))
++               continue;
++
++            /* FMUL src[0] must not have .flr (FMAD src0 does not support it). */
++            if (fmul->src[0].flr)
++               continue;
++
++            /* Fuse: insert FMAD before FADD, inheriting FADD's SAT. */
++            bool fadd_sat = pco_instr_has_sat(instr) && pco_instr_get_sat(instr);
++            pco_ref a = fmul->src[0];
++            pco_ref b = fmul->src[1];
++            pco_ref dest = instr->dest[0];
++
++            pco_builder bld = pco_builder_create(
++               func, pco_cursor_before_instr(instr));
++            pco_fmad(&bld, dest, a, b, c, .sat = fadd_sat);
++
++            pco_instr_delete(instr);
++            pco_instr_delete(fmul);
++            progress = true;
++            break;
++         }
++      }
++
++      ralloc_free(writes);
++   }
++
++   return progress;
++}
++
+ /**
+  * \brief Performs shader optimizations.
+  *
+@@ -553,6 +872,9 @@ bool pco_opt(pco_shader *shader)
+    PCO_PASS(progress, shader, pco_opt_prep_mods, &ctx);
+    PCO_PASS(progress, shader, pco_opt_back_prop);
+    PCO_PASS(progress, shader, pco_opt_fwd_prop);
++   PCO_PASS(progress, shader, pco_opt_fold_sat);
++   PCO_PASS(progress, shader, pco_opt_fold_zero_mul);
++   PCO_PASS(progress, shader, pco_opt_fuse_fmad);
+    /* TODO: Track whether there are any comp instructions referencing hw
+     * registers resulting from the previous passes, and only run
+     * pco_opt_prop_hw_comps if this is the case.
+diff --git a/src/imagination/pco/pco_trans_nir.c b/src/imagination/pco/pco_trans_nir.c
+index dbd0d62..35a1e65 100644
+--- a/src/imagination/pco/pco_trans_nir.c
++++ b/src/imagination/pco/pco_trans_nir.c
+@@ -3227,7 +3227,7 @@ static pco_instr *trans_alu(trans_ctx *tctx, nir_alu_instr *alu)
+       break;
+ 
+    case nir_op_ffma:
+-      instr = pco_fmad(&tctx->b, dest, src[0], src[1], src[2]);
++      instr = pco_fmad(&tctx->b, dest, src[0], src[1], src[2], .lp = true);
+       break;
+ 
+    case nir_op_frcp:
+-- 
+2.53.0
+

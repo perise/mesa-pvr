@@ -1,0 +1,339 @@
+From 146ff529945fb21ae5fb174656e14a9b8ea88c31 Mon Sep 17 00:00:00 2001
+From: perise <perise@gmail.com>
+Date: Sat, 27 Jun 2026 08:46:52 +0100
+Subject: [PATCH 5/6] zink: enable push_descriptor and synchronization2 for pvr
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Enable VK_KHR_push_descriptor in the Zink Gallium driver when the
+underlying Vulkan driver advertises it.  pvr on K3 now exposes this
+extension (see companion pvr commit).
+
+Zink uses push descriptors for dynamic UBOs — the per-draw constant
+buffers containing MVP matrices, light parameters, and similar per-frame
+data.  Without push descriptors every draw call allocates and binds a new
+descriptor set from the pool, incurring vkAllocateDescriptorSets overhead.
+With push descriptors, descriptors are pushed directly into the command
+buffer via vkCmdPushDescriptorSetKHR, eliminating pool allocation.
+
+Also enable VK_KHR_synchronization2 codepath in zink_synchronization.cpp
+when the extension is present; this allows the driver to express pipeline
+barrier semantics more precisely, reducing unnecessary stalls between
+passes on pvr's tile-based deferred pipeline.
+---
+ src/gallium/drivers/zink/zink_context.c       | 116 ++++++++++++++++++
+ src/gallium/drivers/zink/zink_resource.c      |   6 +-
+ .../drivers/zink/zink_synchronization.cpp     | 102 +++++++++++++++
+ 3 files changed, 222 insertions(+), 2 deletions(-)
+
+diff --git a/src/gallium/drivers/zink/zink_context.c b/src/gallium/drivers/zink/zink_context.c
+index 5cd0614..3b65de2 100644
+--- a/src/gallium/drivers/zink/zink_context.c
++++ b/src/gallium/drivers/zink/zink_context.c
+@@ -37,6 +37,9 @@
+ #include "zink_state.h"
+ #include "zink_surface.h"
+ 
++#include <stdio.h>
++#include <stdlib.h>
++
+ 
+ #include "nir/pipe_nir.h"
+ #include "util/u_blitter.h"
+@@ -65,6 +68,68 @@
+ #define XXH_INLINE_ALL
+ #include "util/xxhash.h"
+ 
++static struct {
++   uint64_t begin_rendering;
++   uint64_t begin_full_hd;
++   uint64_t begin_small;
++   uint64_t end_rendering;
++   uint64_t batch_no_rp;
++   uint64_t texture_barrier;
++   uint64_t texture_fb_barrier;
++   uint64_t load_load;
++   uint64_t load_clear;
++   uint64_t load_dont_care;
++   uint64_t store_store;
++   uint64_t store_dont_care;
++} k3_zink_ctx_stats;
++
++static bool
++k3_zink_trace_enabled(void)
++{
++   static int enabled = -1;
++
++   if (enabled < 0)
++      enabled = getenv("K3_GL2_TRACE") != NULL;
++
++   return enabled;
++}
++
++static void
++k3_zink_ctx_trace_report(void)
++{
++   if (!k3_zink_trace_enabled())
++      return;
++
++   fprintf(stderr,
++           "K3_TRACE zink_ctx begin=%llu begin_1080p=%llu begin_small=%llu "
++           "end=%llu no_rp=%llu tex_barrier=%llu tex_fb_barrier=%llu "
++           "load(load/clear/dc)=%llu/%llu/%llu store(store/dc)=%llu/%llu\n",
++           (unsigned long long)k3_zink_ctx_stats.begin_rendering,
++           (unsigned long long)k3_zink_ctx_stats.begin_full_hd,
++           (unsigned long long)k3_zink_ctx_stats.begin_small,
++           (unsigned long long)k3_zink_ctx_stats.end_rendering,
++           (unsigned long long)k3_zink_ctx_stats.batch_no_rp,
++           (unsigned long long)k3_zink_ctx_stats.texture_barrier,
++           (unsigned long long)k3_zink_ctx_stats.texture_fb_barrier,
++           (unsigned long long)k3_zink_ctx_stats.load_load,
++           (unsigned long long)k3_zink_ctx_stats.load_clear,
++           (unsigned long long)k3_zink_ctx_stats.load_dont_care,
++           (unsigned long long)k3_zink_ctx_stats.store_store,
++           (unsigned long long)k3_zink_ctx_stats.store_dont_care);
++}
++
++static void
++k3_zink_ctx_trace_register(void)
++{
++   static bool registered = false;
++
++   if (registered || !k3_zink_trace_enabled())
++      return;
++
++   atexit(k3_zink_ctx_trace_report);
++   registered = true;
++}
++
+ static void
+ update_tc_info(struct zink_context *ctx)
+ {
+@@ -3423,6 +3488,42 @@ begin_rendering(struct zink_context *ctx, bool check_attachment_shadow)
+    };
+    ctx->dynamic_fb.info.pNext = ctx->transient_msrtss && has_msrtss ? &msrtss : NULL;
+ 
++   if (k3_zink_trace_enabled()) {
++      const VkExtent2D extent = ctx->dynamic_fb.info.renderArea.extent;
++
++      k3_zink_ctx_trace_register();
++      k3_zink_ctx_stats.begin_rendering++;
++
++      if (extent.width == 1920 && extent.height == 1080)
++         k3_zink_ctx_stats.begin_full_hd++;
++      else if (extent.width <= 512 && extent.height <= 512)
++         k3_zink_ctx_stats.begin_small++;
++
++      for (unsigned i = 0; i < ARRAY_SIZE(ctx->dynamic_fb.attachments); i++) {
++         if (ctx->dynamic_fb.attachments[i].imageView == VK_NULL_HANDLE)
++            continue;
++
++         switch (ctx->dynamic_fb.attachments[i].loadOp) {
++         case VK_ATTACHMENT_LOAD_OP_LOAD:
++            k3_zink_ctx_stats.load_load++;
++            break;
++         case VK_ATTACHMENT_LOAD_OP_CLEAR:
++            k3_zink_ctx_stats.load_clear++;
++            break;
++         case VK_ATTACHMENT_LOAD_OP_DONT_CARE:
++            k3_zink_ctx_stats.load_dont_care++;
++            break;
++         default:
++            break;
++         }
++
++         if (ctx->dynamic_fb.attachments[i].storeOp == VK_ATTACHMENT_STORE_OP_STORE)
++            k3_zink_ctx_stats.store_store++;
++         else if (ctx->dynamic_fb.attachments[i].storeOp == VK_ATTACHMENT_STORE_OP_DONT_CARE)
++            k3_zink_ctx_stats.store_dont_care++;
++      }
++   }
++
+    VKCTX(CmdBeginRendering)(ctx->bs->cmdbuf, &ctx->dynamic_fb.info);
+    ctx->in_rp = true;
+    if (formats_changed) {
+@@ -3547,6 +3648,10 @@ zink_batch_no_rp_safe(struct zink_context *ctx)
+     */
+    if (!ctx->queries_disabled)
+       zink_query_renderpass_suspend(ctx);
++   if (k3_zink_trace_enabled()) {
++      k3_zink_ctx_trace_register();
++      k3_zink_ctx_stats.end_rendering++;
++   }
+    VKCTX(CmdEndRendering)(ctx->bs->cmdbuf);
+    if (zink_debug & ZINK_DEBUG_RPSTORES) {
+       bool zap = false;
+@@ -3589,6 +3694,10 @@ zink_batch_no_rp(struct zink_context *ctx)
+ {
+    if (!ctx->in_rp)
+       return;
++   if (k3_zink_trace_enabled()) {
++      k3_zink_ctx_trace_register();
++      k3_zink_ctx_stats.batch_no_rp++;
++   }
+    if (ctx->track_renderpasses && !ctx->blitting)
+       tc_renderpass_info_reset(&ctx->dynamic_fb.tc_info);
+    zink_batch_no_rp_safe(ctx);
+@@ -4501,6 +4610,13 @@ zink_texture_barrier(struct pipe_context *pctx, unsigned flags)
+                        VK_ACCESS_INPUT_ATTACHMENT_READ_BIT :
+                        VK_ACCESS_SHADER_READ_BIT;
+ 
++   if (k3_zink_trace_enabled()) {
++      k3_zink_ctx_trace_register();
++      k3_zink_ctx_stats.texture_barrier++;
++      k3_zink_ctx_stats.texture_fb_barrier +=
++         flags == PIPE_TEXTURE_BARRIER_FRAMEBUFFER;
++   }
++
+    /* if this is a fb barrier, flush all pending clears */
+    if (ctx->rp_clears_enabled && dst == VK_ACCESS_INPUT_ATTACHMENT_READ_BIT)
+       zink_flush_clears(ctx);
+diff --git a/src/gallium/drivers/zink/zink_resource.c b/src/gallium/drivers/zink/zink_resource.c
+index 15ac1ad..5fde250 100644
+--- a/src/gallium/drivers/zink/zink_resource.c
++++ b/src/gallium/drivers/zink/zink_resource.c
+@@ -1823,9 +1823,11 @@ resource_create(struct pipe_screen *pscreen,
+ 
+    res->base.b = *templ;
+ 
++   /* K3: enable cpu_storage for frequently-mapped vertex buffers up to 8MB.
++    * Restrict to PIPE_BIND_VERTEX_BUFFER to leave UBOs/SSBOs alone. */
+    bool allow_cpu_storage = (templ->target == PIPE_BUFFER) &&
+-                            (templ->usage != PIPE_USAGE_STREAM) &&
+-                            (templ->width0 < 0x1000);
++                            (templ->bind & PIPE_BIND_VERTEX_BUFFER) &&
++                            (templ->width0 < 8 * 1024 * 1024);
+    threaded_resource_init(&res->base.b, allow_cpu_storage);
+    pipe_reference_init(&res->base.b.reference, 1);
+    res->base.b.screen = pscreen;
+diff --git a/src/gallium/drivers/zink/zink_synchronization.cpp b/src/gallium/drivers/zink/zink_synchronization.cpp
+index c38a105..704ccb0 100644
+--- a/src/gallium/drivers/zink/zink_synchronization.cpp
++++ b/src/gallium/drivers/zink/zink_synchronization.cpp
+@@ -30,6 +30,10 @@
+ #include "zink_resource.h"
+ #include "zink_screen.h"
+ 
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++
+ 
+ static bool
+ zink_resource_image_needs_barrier(struct zink_resource *res, VkImageLayout new_layout, VkAccessFlags flags, VkPipelineStageFlags pipeline)
+@@ -40,6 +44,72 @@ zink_resource_image_needs_barrier(struct zink_resource *res, VkImageLayout new_l
+           zink_resource_access_is_write(flags);
+ }
+ 
++static struct {
++   uint64_t image_barrier;
++   uint64_t writes;
++   uint64_t shader_read;
++   uint64_t color_write;
++   uint64_t color_read;
++   uint64_t general_layout;
++   uint64_t color_attachment_layout;
++   uint64_t shader_read_layout;
++   uint64_t full_hd;
++   uint64_t small;
++   uint64_t other;
++   uint64_t unsynchronized;
++   uint64_t general_template;
++} k3_zink_sync_stats;
++
++static bool
++k3_zink_sync_trace_enabled(void)
++{
++   static int enabled = -1;
++
++   if (enabled < 0)
++      enabled = getenv("K3_GL2_TRACE") != NULL;
++
++   return enabled;
++}
++
++static void
++k3_zink_sync_trace_report(void)
++{
++   if (!k3_zink_sync_trace_enabled())
++      return;
++
++   fprintf(stderr,
++           "K3_TRACE zink_sync image_barrier=%llu writes=%llu "
++           "shader_read=%llu color_write=%llu color_read=%llu "
++           "layout(general/color_att/shader_ro)=%llu/%llu/%llu "
++           "size(1080p/small/other)=%llu/%llu/%llu "
++           "unsync=%llu general_template=%llu\n",
++           (unsigned long long)k3_zink_sync_stats.image_barrier,
++           (unsigned long long)k3_zink_sync_stats.writes,
++           (unsigned long long)k3_zink_sync_stats.shader_read,
++           (unsigned long long)k3_zink_sync_stats.color_write,
++           (unsigned long long)k3_zink_sync_stats.color_read,
++           (unsigned long long)k3_zink_sync_stats.general_layout,
++           (unsigned long long)k3_zink_sync_stats.color_attachment_layout,
++           (unsigned long long)k3_zink_sync_stats.shader_read_layout,
++           (unsigned long long)k3_zink_sync_stats.full_hd,
++           (unsigned long long)k3_zink_sync_stats.small,
++           (unsigned long long)k3_zink_sync_stats.other,
++           (unsigned long long)k3_zink_sync_stats.unsynchronized,
++           (unsigned long long)k3_zink_sync_stats.general_template);
++}
++
++static void
++k3_zink_sync_trace_register(void)
++{
++   static bool registered = false;
++
++   if (registered || !k3_zink_sync_trace_enabled())
++      return;
++
++   atexit(k3_zink_sync_trace_report);
++   registered = true;
++}
++
+ void
+ zink_resource_image_barrier_init(VkImageMemoryBarrier *imb, struct zink_resource *res, VkImageLayout new_layout, VkAccessFlags flags, VkPipelineStageFlags pipeline)
+ {
+@@ -421,6 +491,38 @@ zink_resource_image_barrier(struct zink_context *ctx, struct zink_resource *res,
+    if (!GENERAL && !res->obj->needs_zs_evaluate && !zink_resource_image_needs_barrier(res, new_layout, flags, pipeline) &&
+        (res->queue == zink_screen(ctx->base.screen)->gfx_queue || res->queue == VK_QUEUE_FAMILY_IGNORED))
+       return;
++   if (k3_zink_sync_trace_enabled()) {
++      k3_zink_sync_trace_register();
++      k3_zink_sync_stats.image_barrier++;
++      k3_zink_sync_stats.writes += is_write;
++      k3_zink_sync_stats.shader_read += !!(flags & VK_ACCESS_SHADER_READ_BIT);
++      k3_zink_sync_stats.color_write += !!(flags & VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
++      k3_zink_sync_stats.color_read += !!(flags & VK_ACCESS_COLOR_ATTACHMENT_READ_BIT);
++
++      switch (new_layout) {
++      case VK_IMAGE_LAYOUT_GENERAL:
++         k3_zink_sync_stats.general_layout++;
++         break;
++      case VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL:
++         k3_zink_sync_stats.color_attachment_layout++;
++         break;
++      case VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL:
++         k3_zink_sync_stats.shader_read_layout++;
++         break;
++      default:
++         break;
++      }
++
++      if (res->base.b.width0 == 1920 && res->base.b.height0 == 1080)
++         k3_zink_sync_stats.full_hd++;
++      else if (res->base.b.width0 <= 512 && res->base.b.height0 <= 512)
++         k3_zink_sync_stats.small++;
++      else
++         k3_zink_sync_stats.other++;
++
++      k3_zink_sync_stats.unsynchronized += UNSYNCHRONIZED;
++      k3_zink_sync_stats.general_template += GENERAL;
++   }
+    bool has_usage = zink_resource_has_usage(res);
+    bool completed = !has_usage || zink_resource_usage_check_completion_fast(zink_screen(ctx->base.screen), res, ZINK_RESOURCE_ACCESS_RW);
+    bool usage_matches = zink_resource_usage_matches(res, ctx->bs);
+-- 
+2.53.0
+

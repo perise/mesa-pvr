@@ -117,6 +117,12 @@ struct pvr_texture_state_info {
     * Use a YVU format instead of YUV
     */
    bool swap_chroma;
+
+   /**
+    * K3 OPT: Image was written by PBE with FBCDC lossless compression.
+    * When true the TPU must read it with FB_DIRECT compression mode.
+    */
+   bool fbcdc_compressed;
 };
 
 #ifdef PVR_PER_ARCH

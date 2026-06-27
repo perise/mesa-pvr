@@ -28,6 +28,8 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <vulkan/vulkan.h>
 
@@ -79,6 +81,7 @@
 #include "vk_log.h"
 #include "vk_object.h"
 #include "vk_pipeline_layout.h"
+#include "vk_descriptor_update_template.h"
 #include "vk_synchronization.h"
 #include "vk_util.h"
 
@@ -102,6 +105,66 @@ struct pvr_compute_kernel_info {
    uint32_t local_size[PVR_WORKGROUP_DIMENSIONS];
    uint32_t max_instances;
 };
+
+static struct {
+   uint64_t gfx_jobs;
+   uint64_t dynamic_render_jobs;
+   uint64_t barrier_store;
+   uint64_t barrier_load;
+   uint64_t bg_tag;
+   uint64_t process_empty_tiles;
+   uint64_t load_op_state;
+   uint64_t z_only;
+   uint64_t full_hd;
+   uint64_t small;
+   uint64_t other;
+} k3_pvr_stats;
+
+static bool
+k3_pvr_trace_enabled(void)
+{
+   static int enabled = -1;
+
+   if (enabled < 0)
+      enabled = getenv("K3_GL2_TRACE") != NULL;
+
+   return enabled;
+}
+
+static void
+k3_pvr_trace_report(void)
+{
+   if (!k3_pvr_trace_enabled())
+      return;
+
+   fprintf(stderr,
+           "K3_TRACE pvr gfx_jobs=%llu dyn=%llu barrier(store/load)=%llu/%llu "
+           "bg_tag=%llu empty_tiles=%llu load_op=%llu z_only=%llu "
+           "size(1080p/small/other)=%llu/%llu/%llu\n",
+           (unsigned long long)k3_pvr_stats.gfx_jobs,
+           (unsigned long long)k3_pvr_stats.dynamic_render_jobs,
+           (unsigned long long)k3_pvr_stats.barrier_store,
+           (unsigned long long)k3_pvr_stats.barrier_load,
+           (unsigned long long)k3_pvr_stats.bg_tag,
+           (unsigned long long)k3_pvr_stats.process_empty_tiles,
+           (unsigned long long)k3_pvr_stats.load_op_state,
+           (unsigned long long)k3_pvr_stats.z_only,
+           (unsigned long long)k3_pvr_stats.full_hd,
+           (unsigned long long)k3_pvr_stats.small,
+           (unsigned long long)k3_pvr_stats.other);
+}
+
+static void
+k3_pvr_trace_register(void)
+{
+   static bool registered = false;
+
+   if (registered || !k3_pvr_trace_enabled())
+      return;
+
+   atexit(k3_pvr_trace_report);
+   registered = true;
+}
 
 static void
 pvr_dynamic_render_info_destroy(const struct pvr_device *device,
@@ -189,6 +252,15 @@ static void pvr_cmd_buffer_free_sub_cmds(struct pvr_cmd_buffer *cmd_buffer)
    }
 }
 
+static void pvr_cmd_buffer_free_push_desc_cache(struct pvr_cmd_buffer *cmd_buffer)
+{
+   for (uint32_t i = 0U; i < PVR_MAX_DESCRIPTOR_SETS; i++) {
+      pvr_bo_suballoc_free(cmd_buffer->push_desc_bo_cache[i]);
+      cmd_buffer->push_desc_bo_cache[i] = NULL;
+      cmd_buffer->push_desc_bo_cache_size[i] = 0U;
+   }
+}
+
 static void pvr_cmd_buffer_free_resources(struct pvr_cmd_buffer *cmd_buffer)
 {
    pvr_cmd_buffer_attachments_free(cmd_buffer);
@@ -197,6 +269,17 @@ static void pvr_cmd_buffer_free_resources(struct pvr_cmd_buffer *cmd_buffer)
    util_dynarray_fini(&cmd_buffer->state.query_indices);
 
    pvr_cmd_buffer_free_sub_cmds(cmd_buffer);
+
+   /* Free CPU-side push descriptor set structs */
+   util_dynarray_foreach(&cmd_buffer->push_desc_set_ptrs,
+                         struct pvr_descriptor_set *,
+                         set_ptr) {
+      struct pvr_descriptor_set *push_set = *set_ptr;
+      vk_descriptor_set_layout_unref(&cmd_buffer->device->vk,
+                                     &push_set->layout->vk);
+      vk_object_free(&cmd_buffer->device->vk, NULL, push_set);
+   }
+   util_dynarray_clear(&cmd_buffer->push_desc_set_ptrs);
 
    list_for_each_entry_safe (struct pvr_suballoc_bo,
                              suballoc_bo,
@@ -212,6 +295,7 @@ static void pvr_cmd_buffer_free_resources(struct pvr_cmd_buffer *cmd_buffer)
    util_dynarray_fini(&cmd_buffer->deferred_csb_commands);
    util_dynarray_fini(&cmd_buffer->scissor_array);
    util_dynarray_fini(&cmd_buffer->depth_bias_array);
+   util_dynarray_fini(&cmd_buffer->push_desc_set_ptrs);
 }
 
 static void pvr_cmd_buffer_reset(struct vk_command_buffer *vk_cmd_buffer,
@@ -238,6 +322,7 @@ static void pvr_cmd_buffer_destroy(struct vk_command_buffer *vk_cmd_buffer)
    struct pvr_cmd_buffer *cmd_buffer =
       container_of(vk_cmd_buffer, struct pvr_cmd_buffer, vk);
 
+   pvr_cmd_buffer_free_push_desc_cache(cmd_buffer);
    pvr_cmd_buffer_free_resources(cmd_buffer);
    vk_command_buffer_finish(&cmd_buffer->vk);
    vk_free(&cmd_buffer->vk.pool->alloc, cmd_buffer);
@@ -279,6 +364,7 @@ static VkResult pvr_cmd_buffer_create(struct pvr_device *device,
    list_inithead(&cmd_buffer->deferred_clears);
    list_inithead(&cmd_buffer->sub_cmds);
    list_inithead(&cmd_buffer->bo_list);
+   util_dynarray_init(&cmd_buffer->push_desc_set_ptrs, NULL);
 
    *pCommandBuffer = pvr_cmd_buffer_to_handle(cmd_buffer);
 
@@ -582,6 +668,38 @@ static VkResult pvr_sub_cmd_gfx_per_job_fragment_programs_create_and_upload(
          props.msaa_samples = 1;
    }
 
+   /* === EOT PROGRAM CACHE LOOKUP ===
+    * The EOT shader is fully determined by {emit_count, pbe_cs_words[],
+    * msaa_samples, pixel_output_width, tile_buffer_addrs[]}.  Build a key
+    * and check the device-level cache before compiling.
+    *
+    * pbe_cs_words encode the framebuffer GPU address, so a 3-buffer swap
+    * chain produces at most 3 entries; blur's 12 passes produce ~12 entries.
+    * All are reused from frame 2 onward, eliminating per-pass compilation.
+    */
+   struct pvr_eot_cache_key cache_key;
+   memset(&cache_key, 0, sizeof(cache_key));
+   cache_key.emit_count = emit_count;
+   cache_key.msaa_samples = props.msaa_samples;
+   cache_key.pixel_output_width = has_tile_buffers ? pixel_output_width : 0U;
+   memcpy(cache_key.pbe_cs_words, pbe_cs_words,
+          emit_count * ROGUE_NUM_PBESTATE_STATE_WORDS * sizeof(uint32_t));
+   if (has_tile_buffers)
+      memcpy(cache_key.tile_buffer_addrs, props.tile_buffer_addrs,
+             emit_count * sizeof(uint64_t));
+
+   simple_mtx_lock(&device->eot_cache_mtx);
+   for (uint32_t _ci = 0; _ci < device->eot_cache_count; _ci++) {
+      if (memcmp(&device->eot_cache[_ci].key, &cache_key,
+                 sizeof(cache_key)) == 0) {
+         *pds_upload_out = device->eot_cache[_ci].pds_upload;
+         simple_mtx_unlock(&device->eot_cache_mtx);
+         return VK_SUCCESS;
+      }
+   }
+   simple_mtx_unlock(&device->eot_cache_mtx);
+   /* === END CACHE LOOKUP === */
+
    eot =
       pvr_usc_eot(device->pdevice->pco_ctx, &props, &device->pdevice->dev_info);
    usc_temp_count = pco_shader_data(eot)->common.temps;
@@ -632,7 +750,29 @@ static VkResult pvr_sub_cmd_gfx_per_job_fragment_programs_create_and_upload(
 
    vk_free(allocator, staging_buffer);
 
-   return result;
+   if (result != VK_SUCCESS)
+      goto err_free_usc_pixel_program;
+
+   /* === EOT CACHE STORE ===
+    * Populate the cache entry so future calls skip compilation.
+    * Transfer ownership of the USC and PDS suballoc BOs from the
+    * command buffer's bo_list to the device cache.
+    */
+   simple_mtx_lock(&device->eot_cache_mtx);
+   if (device->eot_cache_count < PVR_EOT_CACHE_MAX) {
+      struct pvr_eot_cache_entry *ce =
+         &device->eot_cache[device->eot_cache_count++];
+      ce->key = cache_key;
+      ce->usc_bo = usc_eot_program;
+      ce->pds_upload = *pds_upload_out;
+      /* Remove from cmd_buffer->bo_list: device cache is the owner now. */
+      list_del(&usc_eot_program->link);
+      list_del(&pds_upload_out->pvr_bo->link);
+   }
+   simple_mtx_unlock(&device->eot_cache_mtx);
+   /* === END CACHE STORE === */
+
+   return VK_SUCCESS;
 
 err_free_usc_pixel_program:
    list_del(&usc_eot_program->link);
@@ -1168,6 +1308,12 @@ static void pvr_setup_pbe_state(
    surface_params.height = iview->vk.extent.height;
    surface_params.z_only_render = false;
    surface_params.down_scale = down_scale;
+   /* K3 OPT: Enable FBCDC for TWIDDLED colour-attachment-only images. */
+   surface_params.enable_fbcdc =
+      PVR_HAS_FEATURE(dev_info, fbcdc_algorithm) &&
+      image->memlayout == PVR_MEMLAYOUT_TWIDDLED &&
+      (image->vk.usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) &&
+      !(image->vk.usage & VK_IMAGE_USAGE_TRANSFER_DST_BIT);
 
    /* Setup render parameters. */
 
@@ -1987,6 +2133,28 @@ static VkResult pvr_sub_cmd_gfx_job_init(const struct pvr_device_info *dev_info,
 
    /* TODO: Enable pixel merging when it's safe to do. */
    job->disable_pixel_merging = true;
+
+   if (k3_pvr_trace_enabled()) {
+      const VkExtent2D extent = render_pass_info->render_area.extent;
+
+      k3_pvr_trace_register();
+      k3_pvr_stats.gfx_jobs++;
+      k3_pvr_stats.dynamic_render_jobs +=
+         cmd_buffer->state.current_sub_cmd->is_dynamic_render;
+      k3_pvr_stats.barrier_store += sub_cmd->barrier_store;
+      k3_pvr_stats.barrier_load += sub_cmd->barrier_load;
+      k3_pvr_stats.bg_tag += job->enable_bg_tag;
+      k3_pvr_stats.process_empty_tiles += job->process_empty_tiles;
+      k3_pvr_stats.load_op_state += hw_render->load_op_state != NULL;
+      k3_pvr_stats.z_only += job->z_only_render;
+
+      if (extent.width == 1920 && extent.height == 1080)
+         k3_pvr_stats.full_hd++;
+      else if (extent.width <= 512 && extent.height <= 512)
+         k3_pvr_stats.small++;
+      else
+         k3_pvr_stats.other++;
+   }
 
    return VK_SUCCESS;
 }
@@ -3220,16 +3388,23 @@ static inline VkResult pvr_render_targets_datasets_create(
       if (render_target->valid_mask & BITFIELD_BIT(view_idx))
          continue;
 
-      result = pvr_arch_render_target_dataset_create(device,
-                                                     rstate->width,
-                                                     rstate->height,
-                                                     hw_render->sample_count,
-                                                     layers,
-                                                     &rt_dataset);
-      if (result != VK_SUCCESS) {
-         pvr_render_targets_datasets_destroy(render_target);
-         pthread_mutex_unlock(&render_target->mutex);
-         return result;
+      rt_dataset = pvr_rt_dataset_cache_get(device,
+                                            rstate->width,
+                                            rstate->height,
+                                            hw_render->sample_count,
+                                            layers);
+      if (!rt_dataset) {
+         result = pvr_arch_render_target_dataset_create(device,
+                                                        rstate->width,
+                                                        rstate->height,
+                                                        hw_render->sample_count,
+                                                        layers,
+                                                        &rt_dataset);
+         if (result != VK_SUCCESS) {
+            pvr_render_targets_datasets_destroy(render_target);
+            pthread_mutex_unlock(&render_target->mutex);
+            return result;
+         }
       }
 
       render_target->valid_mask |= BITFIELD_BIT(view_idx);
@@ -9946,6 +10121,294 @@ VkResult PVR_PER_ARCH(EndCommandBuffer)(VkCommandBuffer commandBuffer)
    util_dynarray_fini(&state->query_indices);
 
    return vk_command_buffer_end(&cmd_buffer->vk);
+}
+
+
+void PVR_PER_ARCH(CmdPushDescriptorSetKHR)(
+   VkCommandBuffer commandBuffer,
+   VkPipelineBindPoint pipelineBindPoint,
+   VkPipelineLayout layout,
+   uint32_t set,
+   uint32_t descriptorWriteCount,
+   const VkWriteDescriptorSet *pDescriptorWrites)
+{
+   VK_FROM_HANDLE(pvr_cmd_buffer, cmd_buffer, commandBuffer);
+   VK_FROM_HANDLE(vk_pipeline_layout, pipe_layout, layout);
+   struct pvr_device *const device = cmd_buffer->device;
+   const uint32_t cache_line_size =
+      pvr_get_slc_cache_line_size(&device->pdevice->dev_info);
+   struct pvr_descriptor_set_layout *set_layout;
+   struct pvr_descriptor_set *desc_set;
+   unsigned set_alloc_size;
+
+   PVR_CHECK_COMMAND_BUFFER_BUILDING_STATE(cmd_buffer);
+
+   assert(set < pipe_layout->set_count);
+   set_layout =
+      vk_to_pvr_descriptor_set_layout(pipe_layout->set_layouts[set]);
+
+   /* Allocate CPU-side descriptor set struct (includes dynamic_buffers[]) */
+   set_alloc_size =
+      sizeof(*desc_set) +
+      set_layout->dynamic_buffer_count * sizeof(*desc_set->dynamic_buffers);
+   desc_set = vk_object_zalloc(&device->vk, NULL, set_alloc_size,
+                               VK_OBJECT_TYPE_DESCRIPTOR_SET);
+   if (!desc_set) {
+      pvr_cmd_buffer_set_error_unwarned(cmd_buffer,
+                                        VK_ERROR_OUT_OF_HOST_MEMORY);
+      return;
+   }
+
+   /* Allocate GPU-accessible memory for descriptor data.
+    * Reuse cached BO for this set slot when possible to avoid
+    * per-draw pvr_bo_suballoc overhead (TBDR push descriptor opt). */
+   if (set_layout->size > 0) {
+      struct pvr_suballoc_bo *desc_bo;
+
+      if (cmd_buffer->push_desc_bo_cache[set] &&
+          cmd_buffer->push_desc_bo_cache_size[set] >= set_layout->size) {
+         /* Reuse existing BO; zero it so unwritten slots stay clean. */
+         desc_bo = cmd_buffer->push_desc_bo_cache[set];
+         memset(pvr_bo_suballoc_get_map_addr(desc_bo), 0, set_layout->size);
+      } else {
+         /* Free undersized cached BO (if any) and allocate fresh. */
+         pvr_bo_suballoc_free(cmd_buffer->push_desc_bo_cache[set]);
+         VkResult result =
+            pvr_bo_suballoc(&device->suballoc_general,
+                            set_layout->size,
+                            cache_line_size,
+                            true /* zero_on_alloc */,
+                            &desc_bo);
+         if (result != VK_SUCCESS) {
+            vk_object_free(&device->vk, NULL, desc_set);
+            pvr_cmd_buffer_set_error_unwarned(cmd_buffer, result);
+            return;
+         }
+         cmd_buffer->push_desc_bo_cache[set] = desc_bo;
+         cmd_buffer->push_desc_bo_cache_size[set] = set_layout->size;
+      }
+
+      desc_set->dev_addr = desc_bo->dev_addr;
+      desc_set->mapping = pvr_bo_suballoc_get_map_addr(desc_bo);
+      desc_set->size = set_layout->size;
+      /* BO is owned by push_desc_bo_cache; NOT added to bo_list. */
+   }
+
+   vk_descriptor_set_layout_ref(&set_layout->vk);
+   desc_set->layout = set_layout;
+   desc_set->pool = NULL; /* push descriptor sets have no pool */
+
+   /* Track CPU struct in push_desc_set_ptrs for cleanup on reset */
+   util_dynarray_append(&cmd_buffer->push_desc_set_ptrs, desc_set);
+
+   /* Write immutable samplers */
+   PVR_PER_ARCH(descriptor_set_write_immutable_samplers)(set_layout, desc_set);
+
+   /* Write the provided descriptors, rewriting dstSet to our new set */
+   if (descriptorWriteCount > 0) {
+      VkDescriptorSet desc_set_handle =
+         pvr_descriptor_set_to_handle(desc_set);
+      VkWriteDescriptorSet *writes =
+         alloca(descriptorWriteCount * sizeof(*writes));
+
+      memcpy(writes, pDescriptorWrites,
+             descriptorWriteCount * sizeof(*writes));
+      for (uint32_t i = 0; i < descriptorWriteCount; i++)
+         writes[i].dstSet = desc_set_handle;
+
+      PVR_PER_ARCH(UpdateDescriptorSets)(pvr_device_to_handle(device),
+                               descriptorWriteCount, writes, 0, NULL);
+   }
+
+   /* Bind the push descriptor set into command buffer state */
+   struct pvr_descriptor_state *desc_state =
+      (pipelineBindPoint == VK_PIPELINE_BIND_POINT_GRAPHICS)
+         ? &cmd_buffer->state.gfx_desc_state
+         : &cmd_buffer->state.compute_desc_state;
+
+   desc_state->sets[set] = desc_set;
+   desc_state->dirty_sets |= BITFIELD_BIT(set);
+
+   if (pipelineBindPoint == VK_PIPELINE_BIND_POINT_GRAPHICS)
+      cmd_buffer->state.dirty.gfx_desc_dirty = true;
+   else
+      cmd_buffer->state.dirty.compute_desc_dirty = true;
+}
+
+void PVR_PER_ARCH(CmdPushDescriptorSet)(
+   VkCommandBuffer commandBuffer,
+   VkPipelineBindPoint pipelineBindPoint,
+   VkPipelineLayout layout,
+   uint32_t set,
+   uint32_t descriptorWriteCount,
+   const VkWriteDescriptorSet *pDescriptorWrites)
+{
+   PVR_PER_ARCH(CmdPushDescriptorSetKHR)(commandBuffer, pipelineBindPoint,
+                                         layout, set, descriptorWriteCount,
+                                         pDescriptorWrites);
+}
+
+
+void PVR_PER_ARCH(CmdPushDescriptorSet2KHR)(
+   VkCommandBuffer commandBuffer,
+   const VkPushDescriptorSetInfo *pPushDescriptorSetInfo)
+{
+   /* Convert stageFlags back to pipelineBindPoint */
+   VkPipelineBindPoint bp =
+      (pPushDescriptorSetInfo->stageFlags & VK_SHADER_STAGE_COMPUTE_BIT)
+         ? VK_PIPELINE_BIND_POINT_COMPUTE
+         : VK_PIPELINE_BIND_POINT_GRAPHICS;
+
+   PVR_PER_ARCH(CmdPushDescriptorSetKHR)(
+      commandBuffer,
+      bp,
+      pPushDescriptorSetInfo->layout,
+      pPushDescriptorSetInfo->set,
+      pPushDescriptorSetInfo->descriptorWriteCount,
+      pPushDescriptorSetInfo->pDescriptorWrites);
+}
+
+void PVR_PER_ARCH(CmdPushDescriptorSet2)(
+   VkCommandBuffer commandBuffer,
+   const VkPushDescriptorSetInfo *pPushDescriptorSetInfo)
+{
+   PVR_PER_ARCH(CmdPushDescriptorSet2KHR)(commandBuffer,
+                                          pPushDescriptorSetInfo);
+}
+
+void PVR_PER_ARCH(CmdPushDescriptorSetWithTemplate2KHR)(
+   VkCommandBuffer commandBuffer,
+   const VkPushDescriptorSetWithTemplateInfo *pPushDescriptorSetWithTemplateInfo)
+{
+   VK_FROM_HANDLE(pvr_cmd_buffer, cmd_buffer, commandBuffer);
+   VK_FROM_HANDLE(vk_pipeline_layout, pipe_layout,
+                  pPushDescriptorSetWithTemplateInfo->layout);
+   VK_FROM_HANDLE(vk_descriptor_update_template, templ,
+                  pPushDescriptorSetWithTemplateInfo->descriptorUpdateTemplate);
+
+   struct pvr_device *const device = cmd_buffer->device;
+   const uint32_t cache_line_size =
+      pvr_get_slc_cache_line_size(&device->pdevice->dev_info);
+   const uint32_t set = pPushDescriptorSetWithTemplateInfo->set;
+
+   PVR_CHECK_COMMAND_BUFFER_BUILDING_STATE(cmd_buffer);
+
+   assert(set < pipe_layout->set_count);
+
+   struct pvr_descriptor_set_layout *set_layout =
+      vk_to_pvr_descriptor_set_layout(pipe_layout->set_layouts[set]);
+
+   const unsigned set_alloc_size =
+      sizeof(struct pvr_descriptor_set) +
+      set_layout->dynamic_buffer_count *
+         sizeof(((struct pvr_descriptor_set *)0)->dynamic_buffers[0]);
+
+   struct pvr_descriptor_set *desc_set =
+      vk_object_zalloc(&device->vk, NULL, set_alloc_size,
+                       VK_OBJECT_TYPE_DESCRIPTOR_SET);
+   if (!desc_set) {
+      pvr_cmd_buffer_set_error_unwarned(cmd_buffer,
+                                        VK_ERROR_OUT_OF_HOST_MEMORY);
+      return;
+   }
+
+   /* Same per-slot BO cache as CmdPushDescriptorSetKHR. */
+   if (set_layout->size > 0) {
+      struct pvr_suballoc_bo *desc_bo;
+
+      if (cmd_buffer->push_desc_bo_cache[set] &&
+          cmd_buffer->push_desc_bo_cache_size[set] >= set_layout->size) {
+         desc_bo = cmd_buffer->push_desc_bo_cache[set];
+         memset(pvr_bo_suballoc_get_map_addr(desc_bo), 0, set_layout->size);
+      } else {
+         pvr_bo_suballoc_free(cmd_buffer->push_desc_bo_cache[set]);
+         VkResult result = pvr_bo_suballoc(&device->suballoc_general,
+                                           set_layout->size,
+                                           cache_line_size,
+                                           true /* zero_on_alloc */,
+                                           &desc_bo);
+         if (result != VK_SUCCESS) {
+            vk_object_free(&device->vk, NULL, desc_set);
+            pvr_cmd_buffer_set_error_unwarned(cmd_buffer, result);
+            return;
+         }
+         cmd_buffer->push_desc_bo_cache[set] = desc_bo;
+         cmd_buffer->push_desc_bo_cache_size[set] = set_layout->size;
+      }
+
+      desc_set->dev_addr = desc_bo->dev_addr;
+      desc_set->mapping = pvr_bo_suballoc_get_map_addr(desc_bo);
+      desc_set->size = set_layout->size;
+      /* BO owned by cache; NOT added to bo_list. */
+   }
+
+   vk_descriptor_set_layout_ref(&set_layout->vk);
+   desc_set->layout = set_layout;
+   desc_set->pool = NULL;
+
+   util_dynarray_append(&cmd_buffer->push_desc_set_ptrs, desc_set);
+
+   PVR_PER_ARCH(descriptor_set_write_immutable_samplers)(set_layout, desc_set);
+
+   /* Apply template writes */
+   PVR_PER_ARCH(UpdateDescriptorSetWithTemplate)(
+      pvr_device_to_handle(device),
+      pvr_descriptor_set_to_handle(desc_set),
+      pPushDescriptorSetWithTemplateInfo->descriptorUpdateTemplate,
+      pPushDescriptorSetWithTemplateInfo->pData);
+
+   const VkPipelineBindPoint bp = templ->bind_point;
+
+   struct pvr_descriptor_state *desc_state =
+      (bp == VK_PIPELINE_BIND_POINT_GRAPHICS)
+         ? &cmd_buffer->state.gfx_desc_state
+         : &cmd_buffer->state.compute_desc_state;
+
+   desc_state->sets[set] = desc_set;
+   desc_state->dirty_sets |= BITFIELD_BIT(set);
+
+   if (bp == VK_PIPELINE_BIND_POINT_GRAPHICS)
+      cmd_buffer->state.dirty.gfx_desc_dirty = true;
+   else
+      cmd_buffer->state.dirty.compute_desc_dirty = true;
+}
+
+void PVR_PER_ARCH(CmdPushDescriptorSetWithTemplate2)(
+   VkCommandBuffer commandBuffer,
+   const VkPushDescriptorSetWithTemplateInfo *pPushDescriptorSetWithTemplateInfo)
+{
+   PVR_PER_ARCH(CmdPushDescriptorSetWithTemplate2KHR)(
+      commandBuffer, pPushDescriptorSetWithTemplateInfo);
+}
+
+void PVR_PER_ARCH(CmdPushDescriptorSetWithTemplateKHR)(
+   VkCommandBuffer commandBuffer,
+   VkDescriptorUpdateTemplate descriptorUpdateTemplate,
+   VkPipelineLayout layout,
+   uint32_t set,
+   const void *pData)
+{
+   const VkPushDescriptorSetWithTemplateInfo info = {
+      .sType =
+         VK_STRUCTURE_TYPE_PUSH_DESCRIPTOR_SET_WITH_TEMPLATE_INFO_KHR,
+      .pNext = NULL,
+      .descriptorUpdateTemplate = descriptorUpdateTemplate,
+      .layout = layout,
+      .set = set,
+      .pData = pData,
+   };
+   PVR_PER_ARCH(CmdPushDescriptorSetWithTemplate2KHR)(commandBuffer, &info);
+}
+
+void PVR_PER_ARCH(CmdPushDescriptorSetWithTemplate)(
+   VkCommandBuffer commandBuffer,
+   VkDescriptorUpdateTemplate descriptorUpdateTemplate,
+   VkPipelineLayout layout,
+   uint32_t set,
+   const void *pData)
+{
+   PVR_PER_ARCH(CmdPushDescriptorSetWithTemplateKHR)(
+      commandBuffer, descriptorUpdateTemplate, layout, set, pData);
 }
 
 void PVR_PER_ARCH(GetRenderingAreaGranularity)(

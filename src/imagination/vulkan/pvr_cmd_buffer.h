@@ -533,6 +533,9 @@ struct pvr_cmd_buffer {
    /* Buffer usage flags */
    VkCommandBufferUsageFlags usage_flags;
 
+   /* CPU-side pvr_descriptor_set objects for push descriptors; freed on reset */
+   struct util_dynarray push_desc_set_ptrs;
+
    /* Array of struct pvr_depth_bias_state. */
    struct util_dynarray depth_bias_array;
 
@@ -550,6 +553,12 @@ struct pvr_cmd_buffer {
     * capable cores.
     */
    struct list_head deferred_clears;
+
+   /* Per-slot GPU BO cache for push descriptors.
+    * Survives command buffer reset; freed only on destroy.
+    * Index == set number (< PVR_MAX_DESCRIPTOR_SETS). */
+   struct pvr_suballoc_bo *push_desc_bo_cache[PVR_MAX_DESCRIPTOR_SETS];
+   uint32_t push_desc_bo_cache_size[PVR_MAX_DESCRIPTOR_SETS];
 
    /* List of pvr_bo structs associated with this cmd buffer. */
    struct list_head bo_list;

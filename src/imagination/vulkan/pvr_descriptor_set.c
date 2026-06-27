@@ -102,6 +102,10 @@ static unsigned pvr_descriptor_size(VkDescriptorType type)
    case VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT:
       return sizeof(struct pvr_image_descriptor);
 
+   case VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK:
+      /* Inline uniform block: 1 byte per byte of inline data */
+      return 1;
+
    default:
       mesa_loge("Unsupported descriptor type %s.\n",
                 vk_DescriptorType_to_str(type));

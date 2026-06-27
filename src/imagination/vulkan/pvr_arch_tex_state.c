@@ -312,6 +312,13 @@ VkResult pvr_arch_pack_tex_state(struct pvr_device *device,
              vk_format_is_compressed(info->format))
             word1.tpu_image_state_v2_compression_mode =
                ROGUE_TEXSTATE_COMPRESSION_MODE_TPU;
+         /* K3 OPT: FBCDC lossless compression for render targets.
+          * The PBE wrote the image as 8x8-block compressed tiles;
+          * tell the TPU to decompress on read. */
+         else if (PVR_HAS_FEATURE(dev_info, tpu_image_state_v2) &&
+                  info->fbcdc_compressed)
+            word1.tpu_image_state_v2_compression_mode =
+               ROGUE_TEXSTATE_COMPRESSION_MODE_FB_DIRECT_8X8;
       }
    }
 

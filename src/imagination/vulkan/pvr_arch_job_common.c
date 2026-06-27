@@ -174,6 +174,12 @@ void pvr_arch_pbe_pack_state(
       reg.linestride = (surface_params->stride - 1) /
                        ROGUE_PBESTATE_REG_WORD0_LINESTRIDE_UNIT_SIZE;
       reg.minclip_x = render_params->min_x_clip;
+      /* K3 OPT: FBCDC lossless tile compression. The TPU will read these
+       * tiles in FB_DIRECT_8X8 mode; PBE and TPU block sizes must match. */
+      if (surface_params->enable_fbcdc) {
+         reg.compression = ROGUE_PBESTATE_COMPRESSION_ENABLED;
+         reg.compress_size = ROGUE_PBESTATE_COMPRESS_SIZE_BLOCK_8X8;
+      }
 
       /* r, y or depth*/
       switch (surface_params->swizzle[0]) {

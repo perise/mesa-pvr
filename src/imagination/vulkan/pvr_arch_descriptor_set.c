@@ -364,6 +364,17 @@ void PVR_PER_ARCH(UpdateDescriptorSets)(
          }
          break;
 
+      case VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK: {
+         const VkWriteDescriptorSetInlineUniformBlock *iub =
+            vk_find_struct_const(write->pNext,
+                                 WRITE_DESCRIPTOR_SET_INLINE_UNIFORM_BLOCK);
+         assert(iub && iub->pData);
+         void *dst = (uint8_t *)set->mapping
+                     + binding->offset + write->dstArrayElement;
+         memcpy(dst, iub->pData, iub->dataSize);
+         break;
+      }
+
       default:
          UNREACHABLE("");
       }
@@ -548,6 +559,16 @@ void PVR_PER_ARCH(UpdateDescriptorSetWithTemplate)(
                                    entry->array_element + j);
          }
          break;
+
+      case VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK: {
+         /* For templates, data points directly to the inline uniform data;
+          * array_element is the byte offset within the block,
+          * array_count is the byte count to copy. */
+         void *dst = (uint8_t *)set->mapping
+                     + layout_binding->offset + entry->array_element;
+         memcpy(dst, data, entry->array_count);
+         break;
+      }
 
       default:
          UNREACHABLE("Unknown descriptor type");

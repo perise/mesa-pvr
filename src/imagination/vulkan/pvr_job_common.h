@@ -87,6 +87,9 @@ struct pvr_pbe_surf_params {
    uint32_t height;
 
    bool z_only_render;
+
+   /** K3 OPT: Enable FBCDC lossless tile compression in the PBE. */
+   bool enable_fbcdc;
    bool down_scale;
 };
 

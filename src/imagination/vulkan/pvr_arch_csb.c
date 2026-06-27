@@ -121,16 +121,27 @@ static bool pvr_csb_buffer_extend(struct pvr_csb *csb)
    STATIC_ASSERT(ROGUE_VDMCTRL_GUARD_SIZE_DEFAULT ==
                  ROGUE_CDMCTRL_GUARD_SIZE_DEFAULT);
 
-   result = pvr_bo_alloc(csb->device,
-                         csb->device->heaps.general_heap,
-                         PVR_CMD_BUFFER_CSB_BO_SIZE,
-                         cache_line_size,
-                         PVR_BO_ALLOC_FLAG_CPU_MAPPED,
-                         &pvr_bo);
-   if (result != VK_SUCCESS) {
-      vk_error(csb->device, result);
-      csb->status = result;
-      return false;
+   /* Try to reuse a pooled CSB BO before allocating a new one.
+    * Pooled BOs are already CPU-mapped and GPU VA-mapped. */
+   simple_mtx_lock(&csb->device->csb_bo_pool_mtx);
+   if (csb->device->csb_bo_pool_count > 0) {
+      pvr_bo = list_first_entry(&csb->device->csb_bo_pool, struct pvr_bo, link);
+      list_del(&pvr_bo->link);
+      csb->device->csb_bo_pool_count--;
+      simple_mtx_unlock(&csb->device->csb_bo_pool_mtx);
+   } else {
+      simple_mtx_unlock(&csb->device->csb_bo_pool_mtx);
+      result = pvr_bo_alloc(csb->device,
+                            csb->device->heaps.general_heap,
+                            PVR_CMD_BUFFER_CSB_BO_SIZE,
+                            cache_line_size,
+                            PVR_BO_ALLOC_FLAG_CPU_MAPPED,
+                            &pvr_bo);
+      if (result != VK_SUCCESS) {
+         vk_error(csb->device, result);
+         csb->status = result;
+         return false;
+      }
    }
 
    /* if this is not the first BO in csb */

@@ -51,6 +51,25 @@ struct pvr_compute_query_shader {
    struct pvr_pds_upload pds_sec_code;
 };
 
+/* PVR_NUM_PBE_EMIT_REGS=8, ROGUE_NUM_PBESTATE_STATE_WORDS=2 */
+#define PVR_EOT_CACHE_MAX 64U
+#define PVR_EOT_PBE_CS_MAX (8U * 2U)
+#define PVR_EOT_TILE_BUF_MAX 8U
+
+struct pvr_eot_cache_key {
+   uint32_t emit_count;
+   uint32_t msaa_samples;
+   uint32_t pixel_output_width;
+   uint32_t pbe_cs_words[PVR_EOT_PBE_CS_MAX];
+   uint64_t tile_buffer_addrs[PVR_EOT_TILE_BUF_MAX];
+};
+
+struct pvr_eot_cache_entry {
+   struct pvr_eot_cache_key key;
+   struct pvr_suballoc_bo *usc_bo; /* device-owned USC suballoc */
+   struct pvr_pds_upload pds_upload; /* device-owned PDS suballoc */
+};
+
 struct pvr_device {
    struct vk_device vk;
    struct pvr_instance *instance;
@@ -146,6 +165,53 @@ struct pvr_device {
 
    simple_mtx_t rs_mtx;
    struct list_head render_states;
+
+   /* Cache of rt_datasets to avoid per-frame recreation in dynamic rendering.
+    * Keyed by (width, height, samples, layers) stored inside the rt_dataset.
+    */
+#define PVR_RT_DATASET_CACHE_SIZE 16
+   simple_mtx_t rt_cache_mtx;
+   bool rt_cache_enabled;
+   struct pvr_rt_dataset *rt_cache[PVR_RT_DATASET_CACHE_SIZE];
+   uint32_t rt_cache_count;
+
+   /* Pool of reusable CSB BOs (size == PVR_CMD_BUFFER_CSB_BO_SIZE, CPU+GPU mapped).
+    * Freed CSB BOs are returned here; pvr_csb_buffer_extend() retrieves them
+    * to avoid per-frame DRM_IOCTL_PVR_CREATE_BO / VM_MAP kernel calls.
+    */
+#define PVR_CSB_BO_POOL_MAX 64
+   simple_mtx_t csb_bo_pool_mtx;
+   struct list_head csb_bo_pool;
+   uint32_t csb_bo_pool_count;
+
+   /* Cache of EOT (End-Of-Tile) USC+PDS programs.
+    * pvr_sub_cmd_gfx_per_job_fragment_programs_create_and_upload() recompiles
+    * the EOT shader every render pass. For glmark2's typical single-attachment
+    * scenes the key is {emit_count, pbe_cs_words[], msaa_samples,
+    * pixel_output_width, tile_buffer_addrs[]}, which is stable within a pass
+    * type. Cache entries persist until device destroy.
+    *
+    * pbe_cs_words encode the framebuffer GPU address, so a 3-buffer swap chain
+    * produces 3 entries; blur's 12 passes produce ~12 entries -- all reused
+    * from frame 2 onward.
+    */
+   simple_mtx_t eot_cache_mtx;
+   struct pvr_eot_cache_entry eot_cache[PVR_EOT_CACHE_MAX];
+   uint32_t eot_cache_count;
+
+   /* Cache of SPM background-object consts_buffer raw GEM BOs.
+    * pvr_arch_spm_init_bgobj_state() allocates one per CmdBeginRendering;
+    * for identical render params the BO content is unchanged frame-to-frame.
+    * Keeping one cached BO avoids per-frame DRM_IOCTL_PVR_CREATE_BO.
+    */
+   simple_mtx_t bgobj_cache_mtx;
+   struct pvr_bo *bgobj_cache_bo;
+   uint64_t bgobj_cache_scratch_addr;
+   uint32_t bgobj_cache_fw, bgobj_cache_fh;
+   uint32_t bgobj_cache_sample_count;
+   uint32_t bgobj_cache_output_reg_count;
+   uint32_t bgobj_cache_tile_buffer_count;
+   bool     bgobj_cache_is_multisampled;
 };
 
 struct pvr_device_memory {

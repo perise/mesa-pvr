@@ -23,6 +23,7 @@
 #include "pvr_entrypoints.h"
 #include "pvr_framebuffer.h"
 #include "pvr_free_list.h"
+#include "pvr_rt_dataset.h"
 #include "pvr_instance.h"
 #include "pvr_job_render.h"
 #include "pvr_macros.h"
@@ -55,11 +56,11 @@
  * TODO: Investigate if a different default size can improve the overall
  * performance of internal driver allocations.
  */
-#define PVR_SUBALLOCATOR_GENERAL_SIZE (128 * 1024)
-#define PVR_SUBALLOCATOR_PDS_SIZE (128 * 1024)
-#define PVR_SUBALLOCATOR_TRANSFER_SIZE (128 * 1024)
-#define PVR_SUBALLOCATOR_USC_SIZE (128 * 1024)
-#define PVR_SUBALLOCATOR_VIS_TEST_SIZE (128 * 1024)
+#define PVR_SUBALLOCATOR_GENERAL_SIZE (512 * 1024)
+#define PVR_SUBALLOCATOR_PDS_SIZE (512 * 1024)
+#define PVR_SUBALLOCATOR_TRANSFER_SIZE (512 * 1024)
+#define PVR_SUBALLOCATOR_USC_SIZE (512 * 1024)
+#define PVR_SUBALLOCATOR_VIS_TEST_SIZE (512 * 1024)
 
 static uint32_t pvr_get_simultaneous_num_allocs(
    const struct pvr_device_info *dev_info,
@@ -852,6 +853,23 @@ VkResult PVR_PER_ARCH(create_device)(struct pvr_physical_device *pdevice,
    simple_mtx_init(&device->rs_mtx, mtx_plain);
    list_inithead(&device->render_states);
 
+   simple_mtx_init(&device->rt_cache_mtx, mtx_plain);
+   device->rt_cache_enabled = true;
+   device->rt_cache_count = 0;
+
+   /* CSB BO pool init */
+   simple_mtx_init(&device->csb_bo_pool_mtx, mtx_plain);
+   list_inithead(&device->csb_bo_pool);
+   device->csb_bo_pool_count = 0;
+
+   /* EOT cache init */
+   simple_mtx_init(&device->eot_cache_mtx, mtx_plain);
+   device->eot_cache_count = 0;
+
+   /* bgobj consts_buffer cache init */
+   simple_mtx_init(&device->bgobj_cache_mtx, mtx_plain);
+   device->bgobj_cache_bo = NULL;
+
    *pDevice = pvr_device_to_handle(device);
 
    return VK_SUCCESS;
@@ -923,6 +941,48 @@ void PVR_PER_ARCH(destroy_device)(struct pvr_device *device,
 {
    if (!device)
       return;
+
+   /* Flush EOT cache */
+   {
+      simple_mtx_lock(&device->eot_cache_mtx);
+      for (uint32_t _i = 0; _i < device->eot_cache_count; _i++) {
+         struct pvr_eot_cache_entry *ce = &device->eot_cache[_i];
+         pvr_bo_suballoc_free(ce->usc_bo);
+         pvr_bo_suballoc_free(ce->pds_upload.pvr_bo);
+      }
+      device->eot_cache_count = 0;
+      simple_mtx_unlock(&device->eot_cache_mtx);
+   }
+   simple_mtx_destroy(&device->eot_cache_mtx);
+
+   /* Flush bgobj consts_buffer cache */
+   {
+      simple_mtx_lock(&device->bgobj_cache_mtx);
+      if (device->bgobj_cache_bo) {
+         pvr_bo_free(device, device->bgobj_cache_bo);
+         device->bgobj_cache_bo = NULL;
+      }
+      simple_mtx_unlock(&device->bgobj_cache_mtx);
+   }
+   simple_mtx_destroy(&device->bgobj_cache_mtx);
+
+   /* Flush CSB BO pool */
+   {
+      struct pvr_bo *pvr_bo, *tmp;
+      simple_mtx_lock(&device->csb_bo_pool_mtx);
+      list_for_each_entry_safe(struct pvr_bo, pvr_bo, &device->csb_bo_pool, link) {
+         list_del(&pvr_bo->link);
+         pvr_bo_free(device, pvr_bo);
+      }
+      device->csb_bo_pool_count = 0;
+      simple_mtx_unlock(&device->csb_bo_pool_mtx);
+   }
+   simple_mtx_destroy(&device->csb_bo_pool_mtx);
+
+   /* Disable caching and flush cached rt_datasets before cleanup */
+   device->rt_cache_enabled = false;
+   pvr_rt_dataset_cache_flush(device);
+   simple_mtx_destroy(&device->rt_cache_mtx);
 
    simple_mtx_lock(&device->rs_mtx);
    list_for_each_entry_safe (struct pvr_render_state,

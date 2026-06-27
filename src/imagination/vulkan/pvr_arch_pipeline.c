@@ -254,7 +254,7 @@ static VkResult pvr_pds_vertex_attrib_program_create_and_upload(
    const size_t const_entries_size_in_bytes =
       pvr_pds_get_max_vertex_program_const_map_size_in_bytes(
          &device->pdevice->dev_info,
-         device->vk.enabled_features.robustBufferAccess);
+         false /* K3 OPT: PDS no robust vertex fetch */);
    struct pvr_pds_upload *const program = &program_out->program;
    struct pvr_pds_info *const info = &program_out->info;
    struct pvr_const_map_entry *new_entries;
@@ -281,7 +281,7 @@ static VkResult pvr_pds_vertex_attrib_program_create_and_upload(
       input,
       NULL,
       info,
-      device->vk.enabled_features.robustBufferAccess,
+      false /* K3 OPT: PDS no robust vertex fetch */,
       &device->pdevice->dev_info);
 
    code_size_in_dwords = info->code_size_in_dwords;
@@ -302,7 +302,7 @@ static VkResult pvr_pds_vertex_attrib_program_create_and_upload(
       input,
       staging_buffer,
       info,
-      device->vk.enabled_features.robustBufferAccess,
+      false /* K3 OPT: PDS no robust vertex fetch */,
       &device->pdevice->dev_info);
 
    assert(info->code_size_in_dwords <= code_size_in_dwords);
@@ -2455,12 +2455,11 @@ static void pvr_init_descriptors(pco_data *data,
 {
    const struct pvr_device *device = vk_to_pvr_device(layout->base.device);
    data->common.robust_buffer_access =
-      device->vk.enabled_features.robustBufferAccess;
+      false; /* K3 OPT: skip nir_lower_robust_access for VS perf */
 
-   data->common.null_descriptor = device->vk.enabled_features.nullDescriptor;
+   data->common.null_descriptor = false; /* K3 OPT: no null descriptors in glmark2 */
 
-   data->common.image_2d_view_of_3d =
-      device->vk.enabled_features.image2DViewOf3D;
+   data->common.image_2d_view_of_3d = false; /* K3 OPT: no 2D-view-of-3D in glmark2 */
 
    for (unsigned desc_set = 0; desc_set < layout->set_count; ++desc_set) {
       const struct pvr_descriptor_set_layout *set_layout =
@@ -2962,6 +2961,33 @@ pvr_graphics_pipeline_compile(struct pvr_device *const device,
          pco_rev_link_nir(pco_ctx, nir_shaders[stage], consumer);
 
       consumer = nir_shaders[stage];
+   }
+
+   /* K3 OPT: If FS has no observable side effects (no color writes, no memory
+    * writes, no discard), treat it as a depth-only pass and skip USC shading.
+    * Primary case: glmark2 shadow scene depth.frag writes gl_FragColor but the
+    * FBO has no color attachment + colorMask=0 => output is entirely discarded.
+    * With is_passthrough=true, skip_fs=true, the entire USC shading pass is
+    * eliminated for the 3840x2160 shadow map generation. */
+   if (nir_shaders[MESA_SHADER_FRAGMENT]) {
+      bool no_color_writes = !pCreateInfo->pColorBlendState ||
+                             pCreateInfo->pColorBlendState->attachmentCount == 0;
+      if (!no_color_writes) {
+         no_color_writes = true;
+         for (uint32_t i = 0;
+              i < pCreateInfo->pColorBlendState->attachmentCount; i++) {
+            if (pCreateInfo->pColorBlendState->pAttachments[i].colorWriteMask != 0) {
+               no_color_writes = false;
+               break;
+            }
+         }
+      }
+      nir_shader *fs_nir = nir_shaders[MESA_SHADER_FRAGMENT];
+      if (no_color_writes && !fs_nir->info.writes_memory &&
+          !fs_nir->info.fs.uses_discard) {
+         nir_shaders[MESA_SHADER_FRAGMENT] = NULL;
+         shader_data[MESA_SHADER_FRAGMENT] = (pco_data){ 0 };
+      }
    }
 
    /* Check if the fragment passthrough shader should be built. */

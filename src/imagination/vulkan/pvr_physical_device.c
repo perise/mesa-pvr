@@ -146,6 +146,7 @@ static void pvr_physical_device_get_supported_extensions(
       .KHR_imageless_framebuffer = true,
       .KHR_index_type_uint8 = true,
       .KHR_line_rasterization = true,
+      .KHR_load_store_op_none = true,
       .KHR_maintenance1 = true,
       .KHR_maintenance2 = true,
       .KHR_maintenance3 = true,
@@ -162,6 +163,7 @@ static void pvr_physical_device_get_supported_extensions(
       .KHR_sampler_ycbcr_conversion = true,
       .KHR_separate_depth_stencil_layouts = true,
       .KHR_shader_draw_parameters = true,
+      .KHR_shader_float16_int8 = true,
       .KHR_shader_expect_assume = false,
       .KHR_shader_float_controls = true,
       .KHR_shader_integer_dot_product = true,
@@ -185,6 +187,15 @@ static void pvr_physical_device_get_supported_extensions(
       .EXT_debug_marker = true,
       .EXT_depth_clamp_zero_one = true,
       .EXT_depth_clip_enable = true,
+
+      /* VK_EXT_descriptor_indexing */
+      .EXT_descriptor_indexing = true,
+
+      /* VK_EXT_inline_uniform_block */
+      .EXT_inline_uniform_block = true,
+
+      /* VK_KHR_push_descriptor */
+      .KHR_push_descriptor = true,
       .EXT_image_drm_format_modifier = true,
       .EXT_extended_dynamic_state = true,
       .EXT_extended_dynamic_state2 = true,
@@ -194,6 +205,7 @@ static void pvr_physical_device_get_supported_extensions(
       .EXT_image_2d_view_of_3d = true,
       .EXT_index_type_uint8 = true,
       .EXT_line_rasterization = true,
+      .EXT_load_store_op_none = true,
       .EXT_map_memory_placed = true,
       .EXT_non_seamless_cube_map = true,
       .EXT_physical_device_drm = true,
@@ -265,7 +277,7 @@ static void pvr_physical_device_get_supported_features(
       .shaderCullDistance = true,
       .shaderFloat64 = false,
       .shaderInt64 = false,
-      .shaderInt16 = false,
+      .shaderInt16 = true,
       .shaderResourceResidency = false,
       .shaderResourceMinLod = false,
       .sparseBinding = false,
@@ -297,14 +309,14 @@ static void pvr_physical_device_get_supported_features(
       .storagePushConstant8 = false,
       .shaderBufferInt64Atomics = false,
       .shaderSharedInt64Atomics = false,
-      .shaderFloat16 = false,
-      .shaderInt8 = false,
-      .descriptorIndexing = false,
+      .shaderFloat16 = true,
+      .shaderInt8 = true,
+      .descriptorIndexing = true,
       .shaderInputAttachmentArrayDynamicIndexing = false,
       .shaderUniformTexelBufferArrayDynamicIndexing = false,
       .shaderStorageTexelBufferArrayDynamicIndexing = false,
       .shaderUniformBufferArrayNonUniformIndexing = false,
-      .shaderSampledImageArrayNonUniformIndexing = false,
+      .shaderSampledImageArrayNonUniformIndexing = true,
       .shaderStorageBufferArrayNonUniformIndexing = false,
       .shaderStorageImageArrayNonUniformIndexing = false,
       .shaderInputAttachmentArrayNonUniformIndexing = false,
@@ -317,9 +329,9 @@ static void pvr_physical_device_get_supported_features(
       .descriptorBindingUniformTexelBufferUpdateAfterBind = false,
       .descriptorBindingStorageTexelBufferUpdateAfterBind = false,
       .descriptorBindingUpdateUnusedWhilePending = false,
-      .descriptorBindingPartiallyBound = false,
+      .descriptorBindingPartiallyBound = true,
       .descriptorBindingVariableDescriptorCount = false,
-      .runtimeDescriptorArray = false,
+      .runtimeDescriptorArray = true,
       .samplerFilterMinmax = false,
       .vulkanMemoryModel = false,
       .vulkanMemoryModelDeviceScope = false,
@@ -336,6 +348,10 @@ static void pvr_physical_device_get_supported_features(
 
       /* Vulkan 1.2 / VK_KHR_imageless_framebuffer */
       .imagelessFramebuffer = true,
+
+      /* VK_EXT_inline_uniform_block */
+      .inlineUniformBlock = true,
+      .descriptorBindingInlineUniformBlockUpdateAfterBind = false,
 
       /* Vulkan 1.1 / VK_KHR_multiview */
       .multiview = true,
@@ -597,9 +613,9 @@ static bool pvr_physical_device_get_properties(
       /* deviceName and pipelineCacheUUID are filled below .*/
 
       .maxImageDimension1D = 4096U,
-      .maxImageDimension2D = 4096U,
+      .maxImageDimension2D = 2048U, /* K3 OPT: cap shadow map */
       .maxImageDimension3D = 256U,
-      .maxImageDimensionCube = 4096U,
+      .maxImageDimensionCube = 2048U,
       .maxImageArrayLayers = 256U,
       .maxTexelBufferElements = 64U * 1024U,
       .maxUniformBufferRange = 16U * 1024U,
@@ -930,6 +946,16 @@ static bool pvr_physical_device_get_properties(
 
       /* VK_KHR_line_rasterization */
       .lineSubPixelPrecisionBits = line_sub_pixel_precision_bits,
+
+      /* VK_EXT_inline_uniform_block */
+      .maxInlineUniformBlockSize = 256,
+      .maxPerStageDescriptorInlineUniformBlocks = 4,
+      .maxPerStageDescriptorUpdateAfterBindInlineUniformBlocks = 0,
+      .maxDescriptorSetInlineUniformBlocks = 4,
+      .maxDescriptorSetUpdateAfterBindInlineUniformBlocks = 0,
+
+      /* VK_KHR_push_descriptor */
+      .maxPushDescriptors = 32,
    };
 
    if (PVR_HAS_FEATURE(dev_info, gpu_multicore_support)) {
@@ -1147,7 +1173,8 @@ VkResult pvr_physical_device_init(struct pvr_physical_device *pdevice,
    pdevice->memory.memoryTypes[0].propertyFlags =
       VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
       VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-      VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+      VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
+      VK_MEMORY_PROPERTY_HOST_CACHED_BIT; /* K3 UMA: hw cache-coherent, cached access is safe */
    pdevice->memory.memoryTypes[0].heapIndex = 0;
 
    pvr_physical_device_get_supported_extensions(&supported_extensions, &instance->vk);

@@ -9,44 +9,38 @@ permissions:
 jobs:
   import:
     runs-on: ubuntu-latest
+    env:
+      GIT_AUTHOR_NAME: perise
+      GIT_AUTHOR_EMAIL: perise@gmail.com
+      GIT_COMMITTER_NAME: perise
+      GIT_COMMITTER_EMAIL: perise@gmail.com
     steps:
       - name: Checkout this repo (patches)
         uses: actions/checkout@v4
         with:
           path: patches-repo
-          token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Setup git auth
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh auth setup-git
-          git config --global user.email "perise@gmail.com"
-          git config --global user.name "perise"
-
-      - name: Clone Mesa (depth=1000, covers 3+ weeks of commits)
+      - name: Clone Mesa (depth=1000)
         run: |
           git clone --depth=1000 --single-branch --branch main \
             https://gitlab.freedesktop.org/mesa/mesa.git mesa
           cd mesa
-          echo "Total commits in shallow clone: $(git rev-list --count HEAD)"
-          git log --oneline -3
-          git log --oneline | grep cff8dbd \
-            && echo "BASE COMMIT FOUND" \
-            || { echo "ERROR: cff8dbd not found, need deeper clone"; exit 1; }
+          git log --oneline | grep -q cff8dbd \
+            && echo "BASE FOUND: $(git log --oneline | grep cff8dbd)" \
+            || { echo "ERROR: cff8dbd not found"; exit 1; }
 
-      - name: Apply K3 patches onto k3-optimizations branch
+      - name: Apply K3 patches
         run: |
           cd mesa
           git checkout -b k3-optimizations cff8dbd4
           git am ../patches-repo/000*.patch
           git log --oneline -8
 
-      - name: Push both branches to perise/mesa-pvr
+      - name: Push to perise/mesa-pvr
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           cd mesa
-          git remote add dest https://github.com/perise/mesa-pvr.git
-          git push --force dest main
-          git push --force dest k3-optimizations
-          echo "Success! Remote now has:"
-          git ls-remote dest refs/heads/main refs/heads/k3-optimizations
+          git remote add dest "https://x-access-token:${TOKEN}@github.com/perise/mesa-pvr.git"
+          git push --force dest main && echo "main OK"
+          git push --force dest k3-optimizations && echo "k3-optimizations OK"

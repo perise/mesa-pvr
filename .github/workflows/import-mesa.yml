@@ -32,31 +32,28 @@ jobs:
           git am ../patches-repo/000*.patch
           git log --oneline -8
 
-      - name: Push branches (with debug output)
+      - name: Debug token and push
         env:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          cd mesa
-          DEST="https://x-access-token:${TOKEN}@github.com/perise/mesa-pvr.git"
-          git remote add dest "$DEST"
-          echo "=== Token type check ===" > /tmp/push-debug.txt
-          echo "Token starts with: ${TOKEN:0:4}" >> /tmp/push-debug.txt
-          echo "=== Repo permissions ===" >> /tmp/push-debug.txt
+          set +e
+          echo "Token prefix: ${TOKEN:0:4}"
+          echo "--- Repo API permissions ---"
           curl -s -H "Authorization: Bearer ${TOKEN}" \
             https://api.github.com/repos/perise/mesa-pvr \
-            | python3 -c "import json,sys; r=json.load(sys.stdin); print('push:', r.get('permissions',{}).get('push'), 'admin:', r.get('permissions',{}).get('admin'))" \
-            >> /tmp/push-debug.txt 2>&1
-          echo "=== Push mesa-upstream ===" >> /tmp/push-debug.txt
-          git push --force dest main:mesa-upstream >> /tmp/push-debug.txt 2>&1
-          echo "push exit: $?" >> /tmp/push-debug.txt
-          echo "=== Push k3-optimizations ===" >> /tmp/push-debug.txt
-          git push --force dest k3-optimizations >> /tmp/push-debug.txt 2>&1
-          echo "push exit: $?" >> /tmp/push-debug.txt
-          cat /tmp/push-debug.txt
-
-      - name: Upload debug log
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: push-debug
-          path: /tmp/push-debug.txt
+            | python3 -c "
+import json,sys
+r=json.load(sys.stdin)
+p=r.get('permissions',{})
+print('push:', p.get('push'), 'admin:', p.get('admin'), 'maintain:', p.get('maintain'))
+print('private:', r.get('private'))
+print('default_branch:', r.get('default_branch'))
+"
+          echo "--- Attempting push: main -> mesa-upstream ---"
+          cd mesa
+          git remote add dest "https://x-access-token:${TOKEN}@github.com/perise/mesa-pvr.git"
+          git push --force --verbose dest main:mesa-upstream
+          echo "EXIT_MAIN=$?"
+          echo "--- Attempting push: k3-optimizations ---"
+          git push --force --verbose dest k3-optimizations
+          echo "EXIT_K3=$?"

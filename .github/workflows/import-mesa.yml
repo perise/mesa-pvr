@@ -21,7 +21,7 @@ jobs:
             https://gitlab.freedesktop.org/mesa/mesa.git mesa
           cd mesa
           git log --oneline | grep -q cff8dbd && echo "BASE FOUND" \
-            || { echo "cff8dbd not found in depth=1000"; exit 1; }
+            || { echo "cff8dbd not found"; exit 1; }
 
       - name: Apply K3 patches
         run: |
@@ -32,19 +32,24 @@ jobs:
           git am ../patches-repo/000*.patch
           git log --oneline -8
 
-      - name: Push to GitHub
+      - name: Diagnose and push
         env:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           cd mesa
-          # Large postBuffer avoids chunked transfer that breaks index-pack
+          echo "=== fsck (missing objects?) ==="
+          git fsck --strict 2>&1 | head -10 || true
+          echo "=== Missing object type ==="
+          git cat-file -t e6703f8e6849878c451f082ea485f9d685379328 2>&1 || echo "NOT IN LOCAL REPO"
+          echo "=== Repack with no deltas ==="
+          git config pack.depth 0
+          git config pack.window 0
+          git repack -a -d
+          echo "=== Push (no deltas, fat pack) ==="
           git config http.postBuffer 524288000
-          git config http.version HTTP/1.1
           DEST="https://x-access-token:${TOKEN}@github.com/perise/mesa-pvr.git"
           git remote add dest "$DEST"
-          echo "=== Push main -> mesa-upstream ==="
           git push --force --no-thin --verbose dest main:mesa-upstream
           echo "EXIT_MAIN=$?"
-          echo "=== Push k3-optimizations ==="
           git push --force --no-thin --verbose dest k3-optimizations
           echo "EXIT_K3=$?"

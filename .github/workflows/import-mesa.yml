@@ -20,8 +20,8 @@ jobs:
           git clone --depth=1000 --single-branch --branch main \
             https://gitlab.freedesktop.org/mesa/mesa.git mesa
           cd mesa
-          git log --oneline | grep -q cff8dbd \
-            && echo "BASE FOUND" || { echo "cff8dbd not found"; exit 1; }
+          git log --oneline | grep -q cff8dbd && echo "BASE FOUND" \
+            || { echo "cff8dbd not found"; exit 1; }
 
       - name: Apply K3 patches
         run: |
@@ -32,17 +32,31 @@ jobs:
           git am ../patches-repo/000*.patch
           git log --oneline -8
 
-      - name: Push branches (mesa-upstream + k3-optimizations)
+      - name: Push branches (with debug output)
         env:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           cd mesa
           DEST="https://x-access-token:${TOKEN}@github.com/perise/mesa-pvr.git"
           git remote add dest "$DEST"
-          # Push upstream mesa as 'mesa-upstream' (avoids default branch conflict)
-          git push --force dest main:mesa-upstream
-          echo "mesa-upstream pushed"
-          # Push our K3 branch
-          git push --force dest k3-optimizations:k3-optimizations
-          echo "k3-optimizations pushed"
-          git ls-remote dest refs/heads/mesa-upstream refs/heads/k3-optimizations
+          echo "=== Token type check ===" > /tmp/push-debug.txt
+          echo "Token starts with: ${TOKEN:0:4}" >> /tmp/push-debug.txt
+          echo "=== Repo permissions ===" >> /tmp/push-debug.txt
+          curl -s -H "Authorization: Bearer ${TOKEN}" \
+            https://api.github.com/repos/perise/mesa-pvr \
+            | python3 -c "import json,sys; r=json.load(sys.stdin); print('push:', r.get('permissions',{}).get('push'), 'admin:', r.get('permissions',{}).get('admin'))" \
+            >> /tmp/push-debug.txt 2>&1
+          echo "=== Push mesa-upstream ===" >> /tmp/push-debug.txt
+          git push --force dest main:mesa-upstream >> /tmp/push-debug.txt 2>&1
+          echo "push exit: $?" >> /tmp/push-debug.txt
+          echo "=== Push k3-optimizations ===" >> /tmp/push-debug.txt
+          git push --force dest k3-optimizations >> /tmp/push-debug.txt 2>&1
+          echo "push exit: $?" >> /tmp/push-debug.txt
+          cat /tmp/push-debug.txt
+
+      - name: Upload debug log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: push-debug
+          path: /tmp/push-debug.txt

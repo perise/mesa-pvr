@@ -1,0 +1,52 @@
+name: Import Mesa + Apply K3 Patches
+
+on:
+  workflow_dispatch:
+    inputs:
+      depth:
+        description: 'Shallow clone depth (days since date)'
+        required: false
+        default: '2026-06-10'
+
+jobs:
+  import:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout this repo (patches)
+        uses: actions/checkout@v4
+        with:
+          path: patches-repo
+
+      - name: Clone Mesa from upstream (shallow)
+        run: |
+          git clone --shallow-since=${{ github.event.inputs.depth || '2026-06-10' }} \
+            --single-branch --branch main \
+            https://gitlab.freedesktop.org/mesa/mesa.git mesa
+          cd mesa
+          git log --oneline -5
+          echo "Base commit present:"
+          git log --oneline | grep cff8dbd || echo "NOT FOUND - adjust depth"
+
+      - name: Create k3-optimizations branch and apply patches
+        run: |
+          cd mesa
+          git config user.email "perise@gmail.com"
+          git config user.name "perise"
+          git checkout -b k3-optimizations cff8dbd4
+          git am ../patches-repo/0001-*.patch
+          git am ../patches-repo/0002-*.patch
+          git am ../patches-repo/0003-*.patch
+          git am ../patches-repo/0004-*.patch
+          git am ../patches-repo/0005-*.patch
+          git am ../patches-repo/0006-*.patch
+          git log --oneline -8
+
+      - name: Push main and k3-optimizations to this repo
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cd mesa
+          git remote add dest https://x-access-token:${GITHUB_TOKEN}@github.com/perise/mesa-pvr.git
+          git push --force dest main k3-optimizations
+          echo "Push complete!"
+          git ls-remote dest

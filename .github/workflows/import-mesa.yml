@@ -9,11 +9,6 @@ permissions:
 jobs:
   import:
     runs-on: ubuntu-latest
-    env:
-      GIT_AUTHOR_NAME: perise
-      GIT_AUTHOR_EMAIL: perise@gmail.com
-      GIT_COMMITTER_NAME: perise
-      GIT_COMMITTER_EMAIL: perise@gmail.com
     steps:
       - name: Checkout this repo (patches)
         uses: actions/checkout@v4
@@ -26,21 +21,28 @@ jobs:
             https://gitlab.freedesktop.org/mesa/mesa.git mesa
           cd mesa
           git log --oneline | grep -q cff8dbd \
-            && echo "BASE FOUND: $(git log --oneline | grep cff8dbd)" \
-            || { echo "ERROR: cff8dbd not found"; exit 1; }
+            && echo "BASE FOUND" || { echo "cff8dbd not found"; exit 1; }
 
       - name: Apply K3 patches
         run: |
           cd mesa
+          git config user.email "perise@gmail.com"
+          git config user.name "perise"
           git checkout -b k3-optimizations cff8dbd4
           git am ../patches-repo/000*.patch
           git log --oneline -8
 
-      - name: Push to perise/mesa-pvr
+      - name: Push branches (mesa-upstream + k3-optimizations)
         env:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           cd mesa
-          git remote add dest "https://x-access-token:${TOKEN}@github.com/perise/mesa-pvr.git"
-          git push --force dest main && echo "main OK"
-          git push --force dest k3-optimizations && echo "k3-optimizations OK"
+          DEST="https://x-access-token:${TOKEN}@github.com/perise/mesa-pvr.git"
+          git remote add dest "$DEST"
+          # Push upstream mesa as 'mesa-upstream' (avoids default branch conflict)
+          git push --force dest main:mesa-upstream
+          echo "mesa-upstream pushed"
+          # Push our K3 branch
+          git push --force dest k3-optimizations:k3-optimizations
+          echo "k3-optimizations pushed"
+          git ls-remote dest refs/heads/mesa-upstream refs/heads/k3-optimizations

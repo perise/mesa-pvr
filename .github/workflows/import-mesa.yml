@@ -32,28 +32,22 @@ jobs:
           git am ../patches-repo/000*.patch
           git log --oneline -8
 
-      - name: Debug token and push
+      - name: Debug and push
         env:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set +e
           echo "Token prefix: ${TOKEN:0:4}"
-          echo "--- Repo API permissions ---"
+          echo "--- Repo permissions ---"
           curl -s -H "Authorization: Bearer ${TOKEN}" \
             https://api.github.com/repos/perise/mesa-pvr \
-            | python3 -c "
-import json,sys
-r=json.load(sys.stdin)
-p=r.get('permissions',{})
-print('push:', p.get('push'), 'admin:', p.get('admin'), 'maintain:', p.get('maintain'))
-print('private:', r.get('private'))
-print('default_branch:', r.get('default_branch'))
-"
-          echo "--- Attempting push: main -> mesa-upstream ---"
+            | jq '{push: .permissions.push, admin: .permissions.admin, private: .private, default_branch: .default_branch}'
           cd mesa
-          git remote add dest "https://x-access-token:${TOKEN}@github.com/perise/mesa-pvr.git"
+          DEST="https://x-access-token:${TOKEN}@github.com/perise/mesa-pvr.git"
+          git remote add dest "$DEST"
+          echo "--- Push main -> mesa-upstream ---"
           git push --force --verbose dest main:mesa-upstream
           echo "EXIT_MAIN=$?"
-          echo "--- Attempting push: k3-optimizations ---"
+          echo "--- Push k3-optimizations ---"
           git push --force --verbose dest k3-optimizations
           echo "EXIT_K3=$?"

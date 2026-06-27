@@ -178,9 +178,8 @@ bool pco_const_imms(pco_shader *shader)
          if (instr->op != PCO_OP_MOVI32)
             continue;
 
-         const struct const_reg_def *const_reg_def =
-            constreg_lookup(pco_ref_get_imm(instr->src[0]));
-
+         uint64_t ci_imm = pco_ref_get_imm(instr->src[0]);
+         const struct const_reg_def *const_reg_def = constreg_lookup((uint32_t)ci_imm);
          if (!const_reg_def)
             continue;
 

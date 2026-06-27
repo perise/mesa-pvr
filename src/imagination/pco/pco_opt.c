@@ -62,8 +62,33 @@ static inline bool pco_opt_prep_mods(pco_shader *shader,
             continue;
 
          pco_foreach_instr_in_func_from (instr, mod) {
-            if (instr->op != PCO_OP_FADD && instr->op != PCO_OP_FMUL)
+            if (instr->op != PCO_OP_FADD && instr->op != PCO_OP_FMUL &&
+                instr->op != PCO_OP_FMAD)
                continue;
+
+            /* FMAD has asymmetric source modifier support:
+             *   src[0]: no modifiers supported
+             *   src[1]: supports abs, neg
+             *   src[2]: supports abs, flr
+             * If the modifier feeds into src[0], swap src[0] and src[1]
+             * (multiplication is commutative) so forward propagation can
+             * fold it into src[1].  src[1]/src[2] are handled by
+             * pco_opt_fwd_prop directly; skip them here.
+             */
+            if (instr->op == PCO_OP_FMAD) {
+               if (!pco_ref_is_ssa(instr->src[0]) ||
+                   instr->src[0].val != mod->dest[0].val)
+                  continue;
+
+               /* Only neg/abs can be fixed by swapping src[0]<->src[1]. */
+               if (mod->op == PCO_OP_FNEG || mod->op == PCO_OP_FABS) {
+                  pco_ref tmp = instr->src[0];
+                  instr->src[0] = instr->src[1];
+                  instr->src[1] = tmp;
+                  progress = true;
+               }
+               continue;
+            }
 
             pco_ref *match_src = NULL;
             pco_ref *other_src = NULL;
@@ -540,6 +565,300 @@ static inline bool pco_opt_prop_hw_comps(pco_shader *shader)
 }
 
 /**
+ * \brief Fold FADD.SAT(x, 0) into the producing FADD/FMUL/FMAD.
+ *
+ * nir_op_fsat translates to FADD dest, src, zero, .sat=true.
+ * When the source is produced by a single-use FADD/FMUL/FMAD — all of which
+ * natively support the SAT modifier — we can set .sat on the producer and
+ * delete the redundant FADD instruction entirely.
+ *
+ * \param[in,out] shader PCO shader.
+ * \return True if any folds were performed.
+ */
+static inline bool pco_opt_fold_sat(pco_shader *shader)
+{
+   bool progress = false;
+   pco_instr **writes;
+   BITSET_WORD *single_use;
+   BITSET_WORD *multi_use;
+
+   pco_foreach_func_in_shader (func, shader) {
+      writes =
+         rzalloc_array_size(NULL, sizeof(*writes), func->next_ssa);
+      single_use =
+         rzalloc_array_size(writes, sizeof(*single_use),
+                            BITSET_WORDS(func->next_ssa));
+      multi_use =
+         rzalloc_array_size(writes, sizeof(*multi_use),
+                            BITSET_WORDS(func->next_ssa));
+
+      /* Pass 1: build a def map and track single vs. multi-use SSA vals. */
+      pco_foreach_instr_in_func (instr, func) {
+         pco_foreach_instr_dest_ssa (pdest, instr) {
+            writes[pdest->val] = instr;
+         }
+
+         pco_foreach_instr_src_ssa (psrc, instr) {
+            if (BITSET_TEST(single_use, psrc->val)) {
+               /* Second use: promote to multi-use, clear single. */
+               BITSET_SET(multi_use, psrc->val);
+               BITSET_CLEAR(single_use, psrc->val);
+            } else if (!BITSET_TEST(multi_use, psrc->val)) {
+               BITSET_SET(single_use, psrc->val);
+            }
+         }
+      }
+
+      /* Pass 2: find FADD dest_f, src0, zero, .sat=true and fold SAT into
+       * the producer when safe. */
+      pco_foreach_instr_in_func_safe (instr, func) {
+         /* Must be FADD with SAT set. */
+         if (instr->op != PCO_OP_FADD || !pco_instr_get_sat(instr))
+            continue;
+
+         /* src[1] must be the hardware zero constant (no source mods). */
+         pco_ref s1 = instr->src[1];
+         if (!pco_ref_is_reg(s1) ||
+             s1.reg_class != PCO_REG_CLASS_CONST ||
+             s1.val != 0 ||
+             pco_ref_has_mods_set(s1))
+            continue;
+
+         /* src[0] must be a plain SSA ref (no source mods on it). */
+         pco_ref s0 = instr->src[0];
+         if (!pco_ref_is_ssa(s0) || pco_ref_has_mods_set(s0))
+            continue;
+
+         /* src[0] must be used only by this instruction. */
+         if (!BITSET_TEST(single_use, s0.val))
+            continue;
+
+         /* Find the instruction that produces src[0]. */
+         pco_instr *prod = writes[s0.val];
+         if (!prod)
+            continue;
+
+         /* Producer must be FADD, FMUL, or FMAD (all support SAT). */
+         if (prod->op != PCO_OP_FADD &&
+             prod->op != PCO_OP_FMUL &&
+             prod->op != PCO_OP_FMAD)
+            continue;
+
+         /* Guard: producer must not already have SAT set (shouldn't happen). */
+         if (!pco_instr_has_sat(prod) || pco_instr_get_sat(prod))
+            continue;
+
+         /* Fold: set SAT on the producer, redirect its dest, delete fsat. */
+         pco_instr_set_sat(prod, true);
+         prod->dest[0] = instr->dest[0];
+         pco_instr_delete(instr);
+         progress = true;
+      }
+
+      ralloc_free(writes);
+   }
+
+   return progress;
+}
+
+
+/**
+ * \brief Folds fmul(x, 0.0) or fmul(0.0, x) -> mov(dest, 0.0).
+ *
+ * Zero muls are introduced during NIR->PCO IR translation (e.g. from
+ * materialDiffuse.r=0.0 dot products). After pco_const_imms converts
+ * movi32(0.0) to mov(const_reg[0]) and pco_opt_fwd_prop propagates the
+ * const_reg[0] into fmul sources, this pass eliminates the multiply.
+ * DCE then removes the now-dead flog/fexp chain.
+ *
+ * \param[in,out] shader PCO shader.
+ * \return True if any folds were performed.
+ */
+static inline bool pco_opt_fold_zero_mul(pco_shader *shader)
+{
+   bool progress = false;
+   pco_instr **writes;
+
+   pco_foreach_func_in_shader (func, shader) {
+      writes = rzalloc_array_size(NULL, sizeof(*writes), func->next_ssa);
+
+      /* Build SSA def map. */
+      pco_foreach_instr_in_func (instr, func) {
+         pco_foreach_instr_dest_ssa (pdest, instr) {
+            writes[pdest->val] = instr;
+         }
+      }
+
+      pco_foreach_instr_in_func_safe (instr, func) {
+         if (instr->op != PCO_OP_FMUL)
+            continue;
+
+         bool zero_found = false;
+         for (unsigned i = 0; i < 2 && !zero_found; i++) {
+            pco_ref src = instr->src[i];
+
+
+            /* Direct immediate zero (fwd_prop propagated mowi32(0) as imm). */
+            if (pco_ref_is_imm(src) && !pco_ref_has_mods_set(src) &&
+                pco_ref_get_imm(src) == 0) {
+               zero_found = true;
+               break;
+            }
+
+            /* Direct const-reg zero (after pco_opt_fwd_prop). */
+            if (pco_ref_is_reg(src) &&
+                src.reg_class == PCO_REG_CLASS_CONST &&
+                src.val == 0 &&
+                !pco_ref_has_mods_set(src)) {
+               zero_found = true;
+               break;
+            }
+
+            /* SSA value still defined by mov(zero_const_reg) or mowi32(0). */
+            if (pco_ref_is_ssa(src) && !pco_ref_has_mods_set(src)) {
+               pco_instr *def = writes[src.val];
+               if (def && def->op == PCO_OP_MOV) {
+                  pco_ref ds = def->src[0];
+                  if (pco_ref_is_reg(ds) &&
+                      ds.reg_class == PCO_REG_CLASS_CONST &&
+                      ds.val == 0 &&
+                      !pco_ref_has_mods_set(ds))
+                     zero_found = true;
+               }
+               if (!zero_found && def && def->op == PCO_OP_MOVI32) {
+                  pco_ref ds = def->src[0];
+                  if (pco_ref_is_imm(ds) && !pco_ref_has_mods_set(ds) &&
+                      pco_ref_get_imm(ds) == 0)
+                     zero_found = true;
+               }
+            }
+         }
+         if (!zero_found)
+            continue;
+
+         /* Replace: fmul(x, 0.0) -> mov(dest, pco_zero) with matching bits. */
+         pco_ref dest = instr->dest[0];
+         pco_ref zero_ref = pco_zero;
+         zero_ref.bits = dest.bits;
+         zero_ref.dtype = dest.dtype;
+
+         pco_builder b =
+            pco_builder_create(func, pco_cursor_before_instr(instr));
+         pco_mov(&b, dest, zero_ref);
+         pco_instr_delete(instr);
+         progress = true;
+      }
+
+      ralloc_free(writes);
+   }
+
+   return progress;
+}
+
+/**
+ * \brief Fuse single-use FMUL+FADD pairs into FMAD.
+ *
+ * NIR aggressively fuses FMUL+FADD -> FFMA, but only when the FMUL is
+ * single-use *at the NIR level*.  After PCO-level forward-propagation,
+ * previously multi-use FMULs may become single-use.  This pass catches
+ * those residual patterns.
+ *
+ * Pattern:      FADD(FMUL(a, b), c)      ->  FMAD(a, b, c)
+ *           FADD.SAT(FMUL(a, b), c)      ->  FMAD.SAT(a, b, c)
+ *
+ * Constraints:
+ *   - FMUL is single-use (only consumed by this FADD).
+ *   - FMUL has no SAT (would clamp before add, which FMAD cannot model).
+ *   - The FADD source reference to the FMUL carries no modifiers.
+ *   - FMUL.src[0] has no .flr (FMAD src0 does not support .flr).
+ *
+ * \param[in,out] shader PCO shader.
+ * \return True if any fusions were performed.
+ */
+
+static inline bool pco_opt_fuse_fmad(pco_shader *shader)
+{
+   bool progress = false;
+   pco_instr **writes;
+   BITSET_WORD *single_use;
+   BITSET_WORD *multi_use;
+
+   pco_foreach_func_in_shader (func, shader) {
+      writes = rzalloc_array_size(NULL, sizeof(*writes), func->next_ssa);
+      single_use = rzalloc_array_size(writes, sizeof(*single_use),
+                                      BITSET_WORDS(func->next_ssa));
+      multi_use = rzalloc_array_size(writes, sizeof(*multi_use),
+                                     BITSET_WORDS(func->next_ssa));
+
+      /* Pass 1: build def map + single-use tracking. */
+      pco_foreach_instr_in_func (instr, func) {
+         pco_foreach_instr_dest_ssa (pdest, instr) {
+            writes[pdest->val] = instr;
+         }
+         pco_foreach_instr_src_ssa (psrc, instr) {
+            if (BITSET_TEST(single_use, psrc->val)) {
+               BITSET_SET(multi_use, psrc->val);
+               BITSET_CLEAR(single_use, psrc->val);
+            } else if (!BITSET_TEST(multi_use, psrc->val)) {
+               BITSET_SET(single_use, psrc->val);
+            }
+         }
+      }
+
+      /* Pass 2: find FADD(FMUL(a,b), c) and fuse to FMAD(a,b,c). */
+      pco_foreach_instr_in_func_safe (instr, func) {
+         if (instr->op != PCO_OP_FADD)
+            continue;
+
+         /* Try each source as the FMUL candidate. */
+         for (unsigned fmul_side = 0; fmul_side < 2; fmul_side++) {
+            pco_ref fmul_ref = instr->src[fmul_side];
+            pco_ref c = instr->src[1 - fmul_side];
+
+            /* FMUL ref must be plain SSA, no modifiers on the ref itself. */
+            if (!pco_ref_is_ssa(fmul_ref) || pco_ref_has_mods_set(fmul_ref))
+               continue;
+
+            /* FMUL must be single-use. */
+            if (!BITSET_TEST(single_use, fmul_ref.val))
+               continue;
+
+            pco_instr *fmul = writes[fmul_ref.val];
+            if (!fmul || fmul->op != PCO_OP_FMUL)
+               continue;
+
+            /* FMUL must not have SAT set. */
+            if (pco_instr_has_sat(fmul) && pco_instr_get_sat(fmul))
+               continue;
+
+            /* FMUL src[0] must not have .flr (FMAD src0 does not support it). */
+            if (fmul->src[0].flr)
+               continue;
+
+            /* Fuse: insert FMAD before FADD, inheriting FADD's SAT. */
+            bool fadd_sat = pco_instr_has_sat(instr) && pco_instr_get_sat(instr);
+            pco_ref a = fmul->src[0];
+            pco_ref b = fmul->src[1];
+            pco_ref dest = instr->dest[0];
+
+            pco_builder bld = pco_builder_create(
+               func, pco_cursor_before_instr(instr));
+            pco_fmad(&bld, dest, a, b, c, .sat = fadd_sat);
+
+            pco_instr_delete(instr);
+            pco_instr_delete(fmul);
+            progress = true;
+            break;
+         }
+      }
+
+      ralloc_free(writes);
+   }
+
+   return progress;
+}
+
+/**
  * \brief Performs shader optimizations.
  *
  * \param[in,out] shader PCO shader.
@@ -553,6 +872,9 @@ bool pco_opt(pco_shader *shader)
    PCO_PASS(progress, shader, pco_opt_prep_mods, &ctx);
    PCO_PASS(progress, shader, pco_opt_back_prop);
    PCO_PASS(progress, shader, pco_opt_fwd_prop);
+   PCO_PASS(progress, shader, pco_opt_fold_sat);
+   PCO_PASS(progress, shader, pco_opt_fold_zero_mul);
+   PCO_PASS(progress, shader, pco_opt_fuse_fmad);
    /* TODO: Track whether there are any comp instructions referencing hw
     * registers resulting from the previous passes, and only run
     * pco_opt_prop_hw_comps if this is the case.

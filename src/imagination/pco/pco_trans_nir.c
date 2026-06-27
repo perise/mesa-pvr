@@ -3227,7 +3227,7 @@ static pco_instr *trans_alu(trans_ctx *tctx, nir_alu_instr *alu)
       break;
 
    case nir_op_ffma:
-      instr = pco_fmad(&tctx->b, dest, src[0], src[1], src[2]);
+      instr = pco_fmad(&tctx->b, dest, src[0], src[1], src[2], .lp = true);
       break;
 
    case nir_op_frcp:

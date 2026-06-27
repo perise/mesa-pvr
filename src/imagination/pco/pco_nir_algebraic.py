@@ -45,12 +45,31 @@ lower_insert_extract = [
 
 lower_algebraic_late.extend(lower_insert_extract)
 
+
+# fmul(a, 0.0) = 0.0: valid for GLES 2.0 where NaN/INF are undefined for highp.
+# This eliminates dead specular computation when shininess/specular uniforms are 0
+# (inline uniforms bake constants; compiler can then DCE the upstream flog/fexp).
+lower_zero_mul = [
+   (('fmul', a, 0.0), 0.0),
+   (('fmul', 0.0, a), 0.0),
+]
+
+lower_algebraic.extend(lower_zero_mul)
+
 lower_b2b = [
    (('b2b32', a), ('ineg', ('b2i32', a))),
    (('b2b1', a), ('ine', a, 0)),
 ]
 
 lower_algebraic.extend(lower_b2b)
+
+lower_b2f16 = [
+   # b2f16/b2i16 not natively supported; lower to 32-bit path + convert.
+   (('b2f16', a), ('f2f16', ('b2f32', a))),
+   (('b2i16', a), ('i2i16', ('b2i32', a))),
+]
+
+lower_algebraic.extend(lower_b2f16)
 
 lower_scmp = [
    # Float comparisons + bool conversions.
@@ -86,3 +105,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+

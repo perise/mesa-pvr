@@ -53,6 +53,7 @@ static const nir_shader_compiler_options nir_options = {
    .lower_ffract = true,
    .lower_find_lsb = true,
    .lower_fquantize2f16 = true,
+   .lower_flrp16 = true,
    .lower_flrp32 = true,
    .lower_fmod = true,
    .lower_fpow = true,
@@ -442,6 +443,76 @@ static bool should_vectorize_mem_cb(unsigned align_mul,
    return true;
 }
 
+/**
+ * \brief Fold fmul(a, 0.0) → 0.0 for GLES 2.0 highp.
+ *
+ * GLES 2.0 §4.5.1: highp float need not handle NaN/Inf. When
+ * ZINK_INLINE_UNIFORMS bakes e.g. shininess=0.0 as a constant, every
+ * fmul whose factor is that constant can be replaced with 0.0. Subsequent
+ * DCE then removes dead flog/fexp/fmul chains in the specular lighting path.
+ *
+ * We use raw bit-pattern matching so the rule fires even when the zero was
+ * inlined as an integer immediate (nir_imm_int) by nir_inline_uniforms,
+ * which the NIR algebraic framework rejects because nir_type_int != nir_type_float.
+ * nir_def_rewrite_uses() immediately updates downstream uses, so a single
+ * forward pass can cascade: fmul(flog(x), 0) → 0, then fmul(0, fexp(y)) → 0.
+ */
+static bool
+pco_nir_fold_zero_mul_instr(nir_builder *b,
+                             nir_instr *instr,
+                             UNUSED void *data)
+{
+   if (instr->type != nir_instr_type_alu)
+      return false;
+
+   nir_alu_instr *alu = nir_instr_as_alu(instr);
+   if (alu->op != nir_op_fmul)
+      return false;
+
+   for (unsigned i = 0; i < 2; i++) {
+      nir_src *src = &alu->src[i].src;
+      if (!nir_src_is_const(*src))
+         continue;
+
+      unsigned comp = alu->src[i].swizzle[0];
+      const nir_const_value *cv = nir_src_as_const_value(*src);
+      unsigned bits = src->ssa->bit_size;
+      bool is_zero = false;
+
+      /* Match +0.0 and -0.0 by masking the sign bit. Works for both
+       * nir_imm_int(0) and nir_imm_float(0.0f) since the bit patterns
+       * are identical for zero. */
+      switch (bits) {
+      case 16: is_zero = (cv[comp].u16 & 0x7fffu) == 0u; break;
+      case 32: is_zero = (cv[comp].u32 & 0x7fffffffu) == 0u; break;
+      case 64: is_zero = (cv[comp].u64 & 0x7fffffffffffffffull) == 0ull; break;
+      default: break;
+      }
+
+      if (!is_zero)
+         continue;
+
+      b->cursor = nir_before_instr(instr);
+      nir_def *zero = nir_imm_floatN_t(b, 0.0, alu->def.bit_size);
+      nir_def_rewrite_uses(&alu->def, zero);
+      nir_instr_remove(instr);
+      return true;
+   }
+
+   return false;
+}
+
+static bool
+pco_nir_fold_zero_mul(nir_shader *nir)
+{
+   bool progress = nir_shader_instructions_pass(
+      nir, pco_nir_fold_zero_mul_instr,
+      nir_metadata_block_index | nir_metadata_dominance,
+      NULL);
+   /* DEBUG: print for ALL stages to find phong shader */
+   return progress;
+}
+
 static void pco_nir_opt(pco_ctx *ctx, nir_shader *nir, bool algebraic)
 {
    bool progress;
@@ -490,10 +561,11 @@ static void pco_nir_opt(pco_ctx *ctx, nir_shader *nir, bool algebraic)
       NIR_PASS(progress, nir, nir_lower_alu);
       NIR_PASS(progress, nir, nir_lower_pack);
 
-      if (algebraic) {
+      if (algebraic)
          NIR_PASS(progress, nir, nir_opt_algebraic);
-         NIR_PASS(progress, nir, pco_nir_lower_algebraic);
-      }
+         /* pco_nir_lower_algebraic is intentionally NOT in this loop:
+          * it oscillates with nir_opt_algebraic (b2b32 <-> ineg+b2i32 cycle).
+          * It is run once after the loop converges instead. */
 
       NIR_PASS(progress, nir, nir_opt_constant_folding);
 
@@ -511,6 +583,23 @@ static void pco_nir_opt(pco_ctx *ctx, nir_shader *nir, bool algebraic)
       NIR_PASS(progress, nir, nir_opt_undef);
       NIR_PASS(progress, nir, nir_opt_loop_unroll);
    } while (progress);
+
+   /* Run pco_nir_lower_algebraic once after the main loop converges.
+    * This avoids the oscillation with nir_opt_algebraic while still
+    * ensuring PCO-specific lowerings (fround_even, b2b32, b2b1, b2f16)
+    * are applied before the backend translation pass. */
+   if (algebraic) {
+      /* Fold fmul(a, 0.0) → 0.0 via raw bit-pattern matching.
+       * Must run before pco_nir_lower_algebraic so the cascaded DCE and
+       * constant-folding below can clean up dead flog/fexp chains. */
+      NIR_PASS(_, nir, pco_nir_fold_zero_mul);
+      NIR_PASS(_, nir, nir_opt_dce);
+      NIR_PASS(_, nir, nir_opt_constant_folding);
+      NIR_PASS(_, nir, pco_nir_lower_algebraic);
+      NIR_PASS(_, nir, nir_opt_dce);
+      NIR_PASS(_, nir, nir_opt_constant_folding);
+      NIR_PASS(_, nir, nir_opt_dce);
+   }
 }
 
 static bool check_mem_writes(nir_builder *b,
@@ -519,6 +608,36 @@ static bool check_mem_writes(nir_builder *b,
 {
    b->shader->info.writes_memory |= nir_intrinsic_writes_external_memory(intr);
    return false;
+}
+
+/**
+ * \brief Callback for nir_lower_bit_size: lower 16-bit integer ops to 32-bit.
+ *
+ * PCO hardware only supports 32-bit integer ALU natively; lower 16-bit
+ * integer arithmetic to 32-bit and truncate the result back.
+ */
+static unsigned
+pco_lower_bit_size_cb(const nir_instr *instr, UNUSED void *data)
+{
+   if (instr->type != nir_instr_type_alu)
+      return 0;
+
+   nir_alu_instr *alu = nir_instr_as_alu(instr);
+   const nir_op_info *info = &nir_op_infos[alu->op];
+
+   /* Lower 16-bit integer result ops to 32-bit. */
+   if (alu->def.bit_size == 16 &&
+       (info->output_type & (nir_type_int | nir_type_uint)))
+      return 32;
+
+   /* Lower comparisons/shifts with 16-bit integer sources to 32-bit. */
+   for (unsigned s = 0; s < info->num_inputs; s++) {
+      if ((info->input_types[s] & (nir_type_int | nir_type_uint)) &&
+          nir_src_bit_size(alu->src[s].src) == 16)
+         return 32;
+   }
+
+   return 0;
 }
 
 /**
@@ -641,7 +760,8 @@ void pco_preprocess_nir(pco_ctx *ctx, nir_shader *nir)
 
    NIR_PASS(_, nir, nir_scale_fdiv);
    NIR_PASS(_, nir, nir_lower_frexp);
-   NIR_PASS(_, nir, nir_lower_flrp, 32, true);
+   NIR_PASS(_, nir, nir_lower_flrp, 16 | 32, true);
+   NIR_PASS(_, nir, nir_lower_bit_size, pco_lower_bit_size_cb, NULL);
 
    NIR_PASS(_, nir, nir_remove_dead_derefs);
    NIR_PASS(_, nir, nir_opt_undef);

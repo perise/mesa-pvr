@@ -5,7 +5,6 @@ on:
 
 permissions:
   contents: write
-  workflows: write
 
 jobs:
   import:
@@ -30,9 +29,17 @@ jobs:
           git config user.email "perise@gmail.com"
           git config user.name "perise"
 
-          # Create orphan root from cff8dbd4 tree — no parent = no shallow boundary issue
+          # Get base tree from cff8dbd4
           BASE_TREE=$(git cat-file -p cff8dbd4 | grep '^tree' | awk '{print $2}')
-          ROOT=$(git commit-tree "$BASE_TREE" \
+
+          # Strip .github/ from the tree — GITHUB_TOKEN cannot push workflow files,
+          # and workflows: write is not a valid permissions key in workflow YAML.
+          FILTERED_TREE=$(git ls-tree "$BASE_TREE" | grep -v $'\t\.github$' | git mktree)
+          echo "Base tree:     $BASE_TREE"
+          echo "Filtered tree: $FILTERED_TREE"
+
+          # Create orphan root (no parents = no shallow boundary issue)
+          ROOT=$(git commit-tree "$FILTERED_TREE" \
             -m "Mesa base: cff8dbd452b8 (2026-06-16) [K3 SpacemiT branch root]")
           echo "Orphan root: $ROOT"
 
@@ -49,4 +56,3 @@ jobs:
           DEST="https://x-access-token:${TOKEN}@github.com/perise/mesa-pvr.git"
           git remote add dest "$DEST"
           git push --force --verbose dest k3-optimizations
-          echo "EXIT=$?"

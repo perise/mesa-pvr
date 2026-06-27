@@ -25,6 +25,8 @@
  **************************************************************************/
 
 #include "util/u_threaded_context.h"
+#include <inttypes.h>
+#include <time.h>
 #include "util/u_cpu_detect.h"
 #include "util/format/u_format.h"
 #include "util/u_framebuffer.h"
@@ -1066,6 +1068,13 @@ tc_is_buffer_on_busy_list(const struct threaded_context *tc, const struct thread
    uint32_t id_hash = tbuf->buffer_id_unique & TC_BUFFER_ID_MASK;
 
    for (unsigned i = 0; i < TC_MAX_BUFFER_LISTS; i++) {
+      /* K3 OPT: Skip the current (not-yet-submitted) batch list.
+       * A buffer only in next_buf_list was just created by tc_invalidate_buffer
+       * and has never been submitted to the GPU. Treating it as busy forces staging
+       * (99x vkCmdCopyBuffer/frame). Skipping lets UNSYNC direct-map the new BO
+       * from the main thread, matching buffer:map performance. */
+      if (i == (int)tc->next_buf_list)
+         continue;
       struct tc_buffer_list *buf_list = (void*)&tc->buffer_lists[i];
 
       /* If the buffer is referenced by a batch that hasn't been flushed (by tc or the driver),
@@ -3047,11 +3056,41 @@ tc_buffer_unmap(struct pipe_context *_pipe, struct pipe_transfer *transfer)
       assert(tres->cpu_storage);
 
       if (tres->cpu_storage) {
-         tc_invalidate_buffer(tc, tres);
-         tc_buffer_subdata(&tc->base, &tres->b,
-                           PIPE_MAP_UNSYNCHRONIZED |
-                           TC_TRANSFER_MAP_UPLOAD_CPU_STORAGE,
-                           0, tres->b.width0, tres->cpu_storage);
+         /* K3 OPT: For repeated glBufferSubData calls per frame, avoid
+          * uploading the full buffer on every call.  When
+          * tc_invalidate_buffer is a no-op (buffer was idle -- same BO
+          * reused), only the modified range needs to be written.
+          */
+         /* Only orphan the buffer (tc_invalidate_buffer) for FULL-buffer updates.
+          * For partial updates, cpu_storage[non-updated-region] is uninitialized, so
+          * uploading the full width0 to a new backing would corrupt the non-updated
+          * region (causing "ISP vertex xy value out of range" errors).
+          * Instead, always use the PARTIAL path for partial updates: tc_improve infers
+          * UNSYNC when the backing is idle (fast), or falls back to staging when busy. */
+         bool k3_is_full_update = (ttrans->b.box.x == 0 &&
+                                   ttrans->b.box.width >= (int)tres->b.width0);
+         uint32_t id_before = tres->buffer_id_unique;
+         if (k3_is_full_update)
+            tc_invalidate_buffer(tc, tres);
+
+         if (k3_is_full_update && tres->buffer_id_unique != id_before) {
+            tc_buffer_subdata(&tc->base, &tres->b,
+                              PIPE_MAP_UNSYNCHRONIZED |
+                              TC_TRANSFER_MAP_UPLOAD_CPU_STORAGE,
+                              0, tres->b.width0, tres->cpu_storage);
+         } else {
+            /* Do NOT pass PIPE_MAP_UNSYNCHRONIZED here.  When the buffer is
+             * GPU-busy, UNSYNC would force THREADED_UNSYNC and call
+             * pipe->buffer_map from the main thread while the GPU is still
+             * reading the buffer, causing corruption (desktop:blur 7 FPS).
+             * Without UNSYNC, tc_improve either infers it (buffer is actually
+             * idle -> fast direct write) or falls through to staging
+             * (buffer busy -> resource_copy_region, safe). */
+            tc_buffer_subdata(&tc->base, &tres->b,
+                              TC_TRANSFER_MAP_UPLOAD_CPU_STORAGE,
+                              ttrans->b.box.x, ttrans->b.box.width,
+                              (uint8_t*)tres->cpu_storage + ttrans->b.box.x);
+         }
          /* This shouldn't have been freed by buffer_subdata. */
          assert(tres->cpu_storage);
       } else {
@@ -3198,11 +3237,19 @@ tc_buffer_subdata(struct pipe_context *_pipe,
 
       u_box_1d(offset, size, &box);
 
-      /* CPU storage is only useful for partial updates. It can add overhead
-       * on glBufferData calls so avoid using it.
-       */
-      if (!tres->cpu_storage && offset == 0 && size == resource->width0)
+      /* K3 SUBDATA OPT: for full-buffer updates on allow_cpu_storage VBOs,
+       * call tc_invalidate_buffer first to obtain a fresh idle backing.
+       * tc_improve then infers UNSYNC, giving a single main-thread memcpy
+       * instead of the staging path incurred when the old backing is GPU-busy.
+       * Without this, buffer:subdata suffers the same busy-backing stall that
+       * Patch A+K3 OPT fix for buffer:map: the backing from frame N is still
+       * referenced in the submitted batch so tc_improve refuses to UNSYNC it.
+       * CPU storage is only useful for partial updates otherwise. */
+      if (!tres->cpu_storage && offset == 0 && size == resource->width0) {
+         if (tres->allow_cpu_storage)
+            tc_invalidate_buffer(tc, tres); /* new backing → idle → UNSYNC */
          usage |= TC_TRANSFER_MAP_UPLOAD_CPU_STORAGE;
+      }
 
       map = tc_buffer_map(_pipe, resource, 0, usage, &box, &transfer);
       if (map) {

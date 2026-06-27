@@ -30,6 +30,10 @@
 #include "zink_resource.h"
 #include "zink_screen.h"
 
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+
 
 static bool
 zink_resource_image_needs_barrier(struct zink_resource *res, VkImageLayout new_layout, VkAccessFlags flags, VkPipelineStageFlags pipeline)
@@ -38,6 +42,72 @@ zink_resource_image_needs_barrier(struct zink_resource *res, VkImageLayout new_l
           (res->obj->access & flags) != flags ||
           zink_resource_access_is_write(res->obj->access) ||
           zink_resource_access_is_write(flags);
+}
+
+static struct {
+   uint64_t image_barrier;
+   uint64_t writes;
+   uint64_t shader_read;
+   uint64_t color_write;
+   uint64_t color_read;
+   uint64_t general_layout;
+   uint64_t color_attachment_layout;
+   uint64_t shader_read_layout;
+   uint64_t full_hd;
+   uint64_t small;
+   uint64_t other;
+   uint64_t unsynchronized;
+   uint64_t general_template;
+} k3_zink_sync_stats;
+
+static bool
+k3_zink_sync_trace_enabled(void)
+{
+   static int enabled = -1;
+
+   if (enabled < 0)
+      enabled = getenv("K3_GL2_TRACE") != NULL;
+
+   return enabled;
+}
+
+static void
+k3_zink_sync_trace_report(void)
+{
+   if (!k3_zink_sync_trace_enabled())
+      return;
+
+   fprintf(stderr,
+           "K3_TRACE zink_sync image_barrier=%llu writes=%llu "
+           "shader_read=%llu color_write=%llu color_read=%llu "
+           "layout(general/color_att/shader_ro)=%llu/%llu/%llu "
+           "size(1080p/small/other)=%llu/%llu/%llu "
+           "unsync=%llu general_template=%llu\n",
+           (unsigned long long)k3_zink_sync_stats.image_barrier,
+           (unsigned long long)k3_zink_sync_stats.writes,
+           (unsigned long long)k3_zink_sync_stats.shader_read,
+           (unsigned long long)k3_zink_sync_stats.color_write,
+           (unsigned long long)k3_zink_sync_stats.color_read,
+           (unsigned long long)k3_zink_sync_stats.general_layout,
+           (unsigned long long)k3_zink_sync_stats.color_attachment_layout,
+           (unsigned long long)k3_zink_sync_stats.shader_read_layout,
+           (unsigned long long)k3_zink_sync_stats.full_hd,
+           (unsigned long long)k3_zink_sync_stats.small,
+           (unsigned long long)k3_zink_sync_stats.other,
+           (unsigned long long)k3_zink_sync_stats.unsynchronized,
+           (unsigned long long)k3_zink_sync_stats.general_template);
+}
+
+static void
+k3_zink_sync_trace_register(void)
+{
+   static bool registered = false;
+
+   if (registered || !k3_zink_sync_trace_enabled())
+      return;
+
+   atexit(k3_zink_sync_trace_report);
+   registered = true;
 }
 
 void
@@ -421,6 +491,38 @@ zink_resource_image_barrier(struct zink_context *ctx, struct zink_resource *res,
    if (!GENERAL && !res->obj->needs_zs_evaluate && !zink_resource_image_needs_barrier(res, new_layout, flags, pipeline) &&
        (res->queue == zink_screen(ctx->base.screen)->gfx_queue || res->queue == VK_QUEUE_FAMILY_IGNORED))
       return;
+   if (k3_zink_sync_trace_enabled()) {
+      k3_zink_sync_trace_register();
+      k3_zink_sync_stats.image_barrier++;
+      k3_zink_sync_stats.writes += is_write;
+      k3_zink_sync_stats.shader_read += !!(flags & VK_ACCESS_SHADER_READ_BIT);
+      k3_zink_sync_stats.color_write += !!(flags & VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
+      k3_zink_sync_stats.color_read += !!(flags & VK_ACCESS_COLOR_ATTACHMENT_READ_BIT);
+
+      switch (new_layout) {
+      case VK_IMAGE_LAYOUT_GENERAL:
+         k3_zink_sync_stats.general_layout++;
+         break;
+      case VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL:
+         k3_zink_sync_stats.color_attachment_layout++;
+         break;
+      case VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL:
+         k3_zink_sync_stats.shader_read_layout++;
+         break;
+      default:
+         break;
+      }
+
+      if (res->base.b.width0 == 1920 && res->base.b.height0 == 1080)
+         k3_zink_sync_stats.full_hd++;
+      else if (res->base.b.width0 <= 512 && res->base.b.height0 <= 512)
+         k3_zink_sync_stats.small++;
+      else
+         k3_zink_sync_stats.other++;
+
+      k3_zink_sync_stats.unsynchronized += UNSYNCHRONIZED;
+      k3_zink_sync_stats.general_template += GENERAL;
+   }
    bool has_usage = zink_resource_has_usage(res);
    bool completed = !has_usage || zink_resource_usage_check_completion_fast(zink_screen(ctx->base.screen), res, ZINK_RESOURCE_ACCESS_RW);
    bool usage_matches = zink_resource_usage_matches(res, ctx->bs);

@@ -1823,9 +1823,11 @@ resource_create(struct pipe_screen *pscreen,
 
    res->base.b = *templ;
 
+   /* K3: enable cpu_storage for frequently-mapped vertex buffers up to 8MB.
+    * Restrict to PIPE_BIND_VERTEX_BUFFER to leave UBOs/SSBOs alone. */
    bool allow_cpu_storage = (templ->target == PIPE_BUFFER) &&
-                            (templ->usage != PIPE_USAGE_STREAM) &&
-                            (templ->width0 < 0x1000);
+                            (templ->bind & PIPE_BIND_VERTEX_BUFFER) &&
+                            (templ->width0 < 8 * 1024 * 1024);
    threaded_resource_init(&res->base.b, allow_cpu_storage);
    pipe_reference_init(&res->base.b.reference, 1);
    res->base.b.screen = pscreen;

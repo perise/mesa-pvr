@@ -37,6 +37,9 @@
 #include "zink_state.h"
 #include "zink_surface.h"
 
+#include <stdio.h>
+#include <stdlib.h>
+
 
 #include "nir/pipe_nir.h"
 #include "util/u_blitter.h"
@@ -64,6 +67,68 @@
 
 #define XXH_INLINE_ALL
 #include "util/xxhash.h"
+
+static struct {
+   uint64_t begin_rendering;
+   uint64_t begin_full_hd;
+   uint64_t begin_small;
+   uint64_t end_rendering;
+   uint64_t batch_no_rp;
+   uint64_t texture_barrier;
+   uint64_t texture_fb_barrier;
+   uint64_t load_load;
+   uint64_t load_clear;
+   uint64_t load_dont_care;
+   uint64_t store_store;
+   uint64_t store_dont_care;
+} k3_zink_ctx_stats;
+
+static bool
+k3_zink_trace_enabled(void)
+{
+   static int enabled = -1;
+
+   if (enabled < 0)
+      enabled = getenv("K3_GL2_TRACE") != NULL;
+
+   return enabled;
+}
+
+static void
+k3_zink_ctx_trace_report(void)
+{
+   if (!k3_zink_trace_enabled())
+      return;
+
+   fprintf(stderr,
+           "K3_TRACE zink_ctx begin=%llu begin_1080p=%llu begin_small=%llu "
+           "end=%llu no_rp=%llu tex_barrier=%llu tex_fb_barrier=%llu "
+           "load(load/clear/dc)=%llu/%llu/%llu store(store/dc)=%llu/%llu\n",
+           (unsigned long long)k3_zink_ctx_stats.begin_rendering,
+           (unsigned long long)k3_zink_ctx_stats.begin_full_hd,
+           (unsigned long long)k3_zink_ctx_stats.begin_small,
+           (unsigned long long)k3_zink_ctx_stats.end_rendering,
+           (unsigned long long)k3_zink_ctx_stats.batch_no_rp,
+           (unsigned long long)k3_zink_ctx_stats.texture_barrier,
+           (unsigned long long)k3_zink_ctx_stats.texture_fb_barrier,
+           (unsigned long long)k3_zink_ctx_stats.load_load,
+           (unsigned long long)k3_zink_ctx_stats.load_clear,
+           (unsigned long long)k3_zink_ctx_stats.load_dont_care,
+           (unsigned long long)k3_zink_ctx_stats.store_store,
+           (unsigned long long)k3_zink_ctx_stats.store_dont_care);
+}
+
+static void
+k3_zink_ctx_trace_register(void)
+{
+   static bool registered = false;
+
+   if (registered || !k3_zink_trace_enabled())
+      return;
+
+   atexit(k3_zink_ctx_trace_report);
+   registered = true;
+}
 
 static void
 update_tc_info(struct zink_context *ctx)
@@ -3423,6 +3488,42 @@ begin_rendering(struct zink_context *ctx, bool check_attachment_shadow)
    };
    ctx->dynamic_fb.info.pNext = ctx->transient_msrtss && has_msrtss ? &msrtss : NULL;
 
+   if (k3_zink_trace_enabled()) {
+      const VkExtent2D extent = ctx->dynamic_fb.info.renderArea.extent;
+
+      k3_zink_ctx_trace_register();
+      k3_zink_ctx_stats.begin_rendering++;
+
+      if (extent.width == 1920 && extent.height == 1080)
+         k3_zink_ctx_stats.begin_full_hd++;
+      else if (extent.width <= 512 && extent.height <= 512)
+         k3_zink_ctx_stats.begin_small++;
+
+      for (unsigned i = 0; i < ARRAY_SIZE(ctx->dynamic_fb.attachments); i++) {
+         if (ctx->dynamic_fb.attachments[i].imageView == VK_NULL_HANDLE)
+            continue;
+
+         switch (ctx->dynamic_fb.attachments[i].loadOp) {
+         case VK_ATTACHMENT_LOAD_OP_LOAD:
+            k3_zink_ctx_stats.load_load++;
+            break;
+         case VK_ATTACHMENT_LOAD_OP_CLEAR:
+            k3_zink_ctx_stats.load_clear++;
+            break;
+         case VK_ATTACHMENT_LOAD_OP_DONT_CARE:
+            k3_zink_ctx_stats.load_dont_care++;
+            break;
+         default:
+            break;
+         }
+
+         if (ctx->dynamic_fb.attachments[i].storeOp == VK_ATTACHMENT_STORE_OP_STORE)
+            k3_zink_ctx_stats.store_store++;
+         else if (ctx->dynamic_fb.attachments[i].storeOp == VK_ATTACHMENT_STORE_OP_DONT_CARE)
+            k3_zink_ctx_stats.store_dont_care++;
+      }
+   }
+
    VKCTX(CmdBeginRendering)(ctx->bs->cmdbuf, &ctx->dynamic_fb.info);
    ctx->in_rp = true;
    if (formats_changed) {
@@ -3547,6 +3648,10 @@ zink_batch_no_rp_safe(struct zink_context *ctx)
     */
    if (!ctx->queries_disabled)
       zink_query_renderpass_suspend(ctx);
+   if (k3_zink_trace_enabled()) {
+      k3_zink_ctx_trace_register();
+      k3_zink_ctx_stats.end_rendering++;
+   }
    VKCTX(CmdEndRendering)(ctx->bs->cmdbuf);
    if (zink_debug & ZINK_DEBUG_RPSTORES) {
       bool zap = false;
@@ -3589,6 +3694,10 @@ zink_batch_no_rp(struct zink_context *ctx)
 {
    if (!ctx->in_rp)
       return;
+   if (k3_zink_trace_enabled()) {
+      k3_zink_ctx_trace_register();
+      k3_zink_ctx_stats.batch_no_rp++;
+   }
    if (ctx->track_renderpasses && !ctx->blitting)
       tc_renderpass_info_reset(&ctx->dynamic_fb.tc_info);
    zink_batch_no_rp_safe(ctx);
@@ -4500,6 +4609,13 @@ zink_texture_barrier(struct pipe_context *pctx, unsigned flags)
    VkAccessFlags dst = flags == PIPE_TEXTURE_BARRIER_FRAMEBUFFER ?
                        VK_ACCESS_INPUT_ATTACHMENT_READ_BIT :
                        VK_ACCESS_SHADER_READ_BIT;
+
+   if (k3_zink_trace_enabled()) {
+      k3_zink_ctx_trace_register();
+      k3_zink_ctx_stats.texture_barrier++;
+      k3_zink_ctx_stats.texture_fb_barrier +=
+         flags == PIPE_TEXTURE_BARRIER_FRAMEBUFFER;
+   }
 
    /* if this is a fb barrier, flush all pending clears */
    if (ctx->rp_clears_enabled && dst == VK_ACCESS_INPUT_ATTACHMENT_READ_BIT)

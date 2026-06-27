@@ -72,8 +72,10 @@ struct pvr_suballocator {
 
    /* Current buffer object where sub-allocations are made from */
    struct pvr_bo *bo;
-   /* Previous buffer that can be used when a new buffer object is needed */
-   struct pvr_bo *bo_cached;
+   /* Pool of recently freed BOs available for reuse (avoids per-frame alloc) */
+#define PVR_SUBALLOC_CACHE_MAX 16U
+   struct pvr_bo *bo_pool[PVR_SUBALLOC_CACHE_MAX];
+   uint32_t bo_pool_count;
    /* Track from where to start the next sub-allocation */
    uint32_t next_offset;
 };

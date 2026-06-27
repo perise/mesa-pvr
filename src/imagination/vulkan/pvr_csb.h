@@ -66,7 +66,7 @@
 /**
  * \brief Size of the individual csb buffer object.
  */
-#define PVR_CMD_BUFFER_CSB_BO_SIZE 4096
+#define PVR_CMD_BUFFER_CSB_BO_SIZE 32768
 
 struct pvr_device;
 

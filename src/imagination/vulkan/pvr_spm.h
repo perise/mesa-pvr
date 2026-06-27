@@ -81,6 +81,17 @@ struct pvr_spm_bgobj_state {
    struct pvr_suballoc_bo *pds_texture_data_upload;
 
    uint64_t pds_reg_values[ROGUE_NUM_CR_PDS_BGRND_WORDS];
+
+   /* Cache key stored by pvr_arch_spm_init_bgobj_state so that
+    * pvr_spm_finish_bgobj_state can return consts_buffer to the
+    * device-level bgobj_cache instead of freeing it.
+    */
+   uint64_t cache_scratch_addr;
+   uint32_t cache_fw, cache_fh;
+   uint32_t cache_sample_count;
+   uint32_t cache_output_reg_count;
+   uint32_t cache_tile_buffer_count;
+   bool     cache_is_multisampled;
 };
 
 void pvr_spm_init_scratch_buffer_store(struct pvr_device *device);

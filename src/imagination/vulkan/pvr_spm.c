@@ -221,5 +221,24 @@ void pvr_spm_finish_bgobj_state(struct pvr_device *device,
                                 struct pvr_spm_bgobj_state *spm_bgobj_state)
 {
    pvr_bo_suballoc_free(spm_bgobj_state->pds_texture_data_upload);
-   pvr_bo_free(device, spm_bgobj_state->consts_buffer);
+
+   /* Return consts_buffer to the device cache if the slot is empty;
+    * otherwise free it.  The cache is keyed on the render params stored
+    * in spm_bgobj_state->cache_* by pvr_arch_spm_init_bgobj_state().
+    */
+   simple_mtx_lock(&device->bgobj_cache_mtx);
+   if (!device->bgobj_cache_bo) {
+      device->bgobj_cache_bo               = spm_bgobj_state->consts_buffer;
+      device->bgobj_cache_scratch_addr     = spm_bgobj_state->cache_scratch_addr;
+      device->bgobj_cache_fw               = spm_bgobj_state->cache_fw;
+      device->bgobj_cache_fh               = spm_bgobj_state->cache_fh;
+      device->bgobj_cache_sample_count     = spm_bgobj_state->cache_sample_count;
+      device->bgobj_cache_output_reg_count = spm_bgobj_state->cache_output_reg_count;
+      device->bgobj_cache_tile_buffer_count= spm_bgobj_state->cache_tile_buffer_count;
+      device->bgobj_cache_is_multisampled  = spm_bgobj_state->cache_is_multisampled;
+      simple_mtx_unlock(&device->bgobj_cache_mtx);
+   } else {
+      simple_mtx_unlock(&device->bgobj_cache_mtx);
+      pvr_bo_free(device, spm_bgobj_state->consts_buffer);
+   }
 }

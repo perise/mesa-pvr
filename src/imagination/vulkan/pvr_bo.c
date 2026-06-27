@@ -526,7 +526,9 @@ void pvr_bo_suballocator_init(struct pvr_suballocator *allocator,
 void pvr_bo_suballocator_fini(struct pvr_suballocator *allocator)
 {
    pvr_bo_free(allocator->device, allocator->bo);
-   pvr_bo_free(allocator->device, allocator->bo_cached);
+   for (uint32_t _i = 0; _i < allocator->bo_pool_count; _i++)
+      pvr_bo_free(allocator->device, allocator->bo_pool[_i]);
+   allocator->bo_pool_count = 0;
 
    simple_mtx_destroy(&allocator->mtx);
 }
@@ -610,15 +612,21 @@ VkResult pvr_bo_suballoc(struct pvr_suballocator *allocator,
 
    alloc_size = MAX2(aligned_size, ALIGN_POT(allocator->default_size, align));
 
-   if (allocator->bo_cached) {
-      struct pvr_winsys_bo *bo_cached = allocator->bo_cached->bo;
-
-      if (alloc_size <= bo_cached->size)
-         allocator->bo = allocator->bo_cached;
-      else
-         pvr_bo_free(allocator->device, allocator->bo_cached);
-
-      allocator->bo_cached = NULL;
+   /* Search pool for a BO of sufficient size */
+   for (uint32_t _i = 0; _i < allocator->bo_pool_count; _i++) {
+      if (alloc_size <= allocator->bo_pool[_i]->bo->size) {
+         allocator->bo = allocator->bo_pool[_i];
+         allocator->bo_pool[_i] =
+            allocator->bo_pool[--allocator->bo_pool_count];
+         break;
+      }
+   }
+   /* Discard pool entries that are too small */
+   if (!allocator->bo) {
+      while (allocator->bo_pool_count > 0) {
+         pvr_bo_free(allocator->device,
+                     allocator->bo_pool[--allocator->bo_pool_count]);
+      }
    }
 
    if (!allocator->bo) {
@@ -667,8 +675,10 @@ void pvr_bo_suballoc_free(struct pvr_suballoc_bo *suballoc_bo)
    simple_mtx_lock(&suballoc_bo->allocator->mtx);
 
    if (p_atomic_read(&suballoc_bo->bo->ref_count) == 1 &&
-       !suballoc_bo->allocator->bo_cached) {
-      suballoc_bo->allocator->bo_cached = suballoc_bo->bo;
+       suballoc_bo->allocator->bo_pool_count < PVR_SUBALLOC_CACHE_MAX) {
+      /* Last ref: push to cache pool instead of freeing */
+      suballoc_bo->allocator->bo_pool[
+         suballoc_bo->allocator->bo_pool_count++] = suballoc_bo->bo;
    } else {
       pvr_bo_free(suballoc_bo->allocator->device, suballoc_bo->bo);
    }

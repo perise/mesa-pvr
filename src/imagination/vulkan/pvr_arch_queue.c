@@ -187,6 +187,12 @@ static void pvr_queue_finish(struct pvr_queue *queue)
          vk_sync_destroy(&queue->device->vk, queue->last_job_signal_sync[i]);
    }
 
+   /* Drain sync pools */
+   for (uint32_t i = 0; i < queue->sync_pending_count; i++)
+      vk_sync_destroy(&queue->device->vk, queue->sync_pending[i]);
+   for (uint32_t i = 0; i < queue->sync_ready_count; i++)
+      vk_sync_destroy(&queue->device->vk, queue->sync_ready[i]);
+
    pvr_arch_render_ctx_destroy(queue->gfx_ctx);
    pvr_arch_compute_ctx_destroy(queue->query_ctx);
    pvr_arch_compute_ctx_destroy(queue->compute_ctx);
@@ -203,20 +209,50 @@ void pvr_arch_queues_destroy(struct pvr_device *device)
    vk_free(&device->vk.alloc, device->queues);
 }
 
+static VkResult pvr_queue_alloc_sync(struct pvr_queue *queue,
+                                     struct pvr_device *device,
+                                     struct vk_sync **sync_out)
+{
+   if (queue->sync_ready_count > 0) {
+      *sync_out = queue->sync_ready[--queue->sync_ready_count];
+      return VK_SUCCESS;
+   }
+   return vk_sync_create(&device->vk,
+                         &device->pdevice->ws->syncobj_type,
+                         0U,
+                         0UL,
+                         sync_out);
+}
+
+static void pvr_queue_retire_sync(struct pvr_queue *queue,
+                                   struct pvr_device *device,
+                                   struct vk_sync *sync)
+{
+   if (!sync)
+      return;
+   if (queue->sync_pending_count < PVR_SYNC_POOL_SIZE) {
+      queue->sync_pending[queue->sync_pending_count++] = sync;
+   } else {
+      vk_sync_destroy(&device->vk, sync);
+   }
+}
+
 static void pvr_update_job_syncs(struct pvr_device *device,
                                  struct pvr_queue *queue,
                                  struct vk_sync *new_signal_sync,
                                  enum pvr_job_type submitted_job_type)
 {
    if (queue->next_job_wait_sync[submitted_job_type]) {
-      vk_sync_destroy(&device->vk,
-                      queue->next_job_wait_sync[submitted_job_type]);
+      pvr_queue_retire_sync(queue,
+                            device,
+                            queue->next_job_wait_sync[submitted_job_type]);
       queue->next_job_wait_sync[submitted_job_type] = NULL;
    }
 
    if (queue->last_job_signal_sync[submitted_job_type]) {
-      vk_sync_destroy(&device->vk,
-                      queue->last_job_signal_sync[submitted_job_type]);
+      pvr_queue_retire_sync(queue,
+                            device,
+                            queue->last_job_signal_sync[submitted_job_type]);
    }
 
    queue->last_job_signal_sync[submitted_job_type] = new_signal_sync;
@@ -239,20 +275,12 @@ pvr_process_graphics_cmd_for_view(struct pvr_device *device,
       PVR_DEV_ADDR_OFFSET(job->ds.addr, job->ds.layer_size * view_index);
    job->view_state.view_index = view_index;
 
-   result = vk_sync_create(&device->vk,
-                           &device->pdevice->ws->syncobj_type,
-                           0U,
-                           0UL,
-                           &geom_signal_sync);
+   result = pvr_queue_alloc_sync(queue, device, &geom_signal_sync);
    if (result != VK_SUCCESS)
       return result;
 
    if (job->run_frag) {
-      result = vk_sync_create(&device->vk,
-                              &device->pdevice->ws->syncobj_type,
-                              0U,
-                              0UL,
-                              &frag_signal_sync);
+      result = pvr_queue_alloc_sync(queue, device, &frag_signal_sync);
       if (result != VK_SUCCESS)
          goto err_destroy_geom_sync;
    }
@@ -367,11 +395,7 @@ static VkResult pvr_process_compute_cmd(struct pvr_device *device,
    struct vk_sync *sync;
    VkResult result;
 
-   result = vk_sync_create(&device->vk,
-                           &device->pdevice->ws->syncobj_type,
-                           0U,
-                           0UL,
-                           &sync);
+   result = pvr_queue_alloc_sync(queue, device, &sync);
    if (result != VK_SUCCESS)
       return result;
 
@@ -397,11 +421,7 @@ static VkResult pvr_process_transfer_cmds(struct pvr_device *device,
    struct vk_sync *sync;
    VkResult result;
 
-   result = vk_sync_create(&device->vk,
-                           &device->pdevice->ws->syncobj_type,
-                           0U,
-                           0UL,
-                           &sync);
+   result = pvr_queue_alloc_sync(queue, device, &sync);
    if (result != VK_SUCCESS)
       return result;
 
@@ -433,11 +453,7 @@ static VkResult pvr_process_query_cmd(struct pvr_device *device,
     * commands?
     */
 
-   result = vk_sync_create(&device->vk,
-                           &device->pdevice->ws->syncobj_type,
-                           0U,
-                           0UL,
-                           &sync);
+   result = pvr_queue_alloc_sync(queue, device, &sync);
    if (result != VK_SUCCESS)
       return result;
 
@@ -902,14 +918,39 @@ static VkResult pvr_clear_last_submits_syncs(struct pvr_queue *queue)
    if (result != VK_SUCCESS)
       return vk_error(queue, result);
 
+   /* GPU is done — reset pending syncs and move to ready pool for reuse. */
+   for (uint32_t i = 0; i < queue->sync_pending_count; i++) {
+      struct vk_sync *s = queue->sync_pending[i];
+      VkResult r = VK_ERROR_UNKNOWN;
+      if (queue->sync_ready_count < PVR_SYNC_POOL_SIZE)
+         r = vk_sync_reset(&queue->device->vk, s);
+      if (r == VK_SUCCESS)
+         queue->sync_ready[queue->sync_ready_count++] = s;
+      else
+         vk_sync_destroy(&queue->device->vk, s);
+   }
+   queue->sync_pending_count = 0;
+
    for (uint32_t i = 0; i < PVR_JOB_TYPE_MAX; i++) {
       if (queue->next_job_wait_sync[i]) {
-         vk_sync_destroy(&queue->device->vk, queue->next_job_wait_sync[i]);
+         VkResult r = VK_ERROR_UNKNOWN;
+         if (queue->sync_ready_count < PVR_SYNC_POOL_SIZE)
+            r = vk_sync_reset(&queue->device->vk, queue->next_job_wait_sync[i]);
+         if (r == VK_SUCCESS)
+            queue->sync_ready[queue->sync_ready_count++] = queue->next_job_wait_sync[i];
+         else
+            vk_sync_destroy(&queue->device->vk, queue->next_job_wait_sync[i]);
          queue->next_job_wait_sync[i] = NULL;
       }
 
       if (queue->last_job_signal_sync[i]) {
-         vk_sync_destroy(&queue->device->vk, queue->last_job_signal_sync[i]);
+         VkResult r = VK_ERROR_UNKNOWN;
+         if (queue->sync_ready_count < PVR_SYNC_POOL_SIZE)
+            r = vk_sync_reset(&queue->device->vk, queue->last_job_signal_sync[i]);
+         if (r == VK_SUCCESS)
+            queue->sync_ready[queue->sync_ready_count++] = queue->last_job_signal_sync[i];
+         else
+            vk_sync_destroy(&queue->device->vk, queue->last_job_signal_sync[i]);
          queue->last_job_signal_sync[i] = NULL;
       }
    }

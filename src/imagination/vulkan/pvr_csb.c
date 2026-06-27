@@ -118,6 +118,18 @@ void pvr_csb_finish(struct pvr_csb *csb)
    } else {
       list_for_each_entry_safe (struct pvr_bo, pvr_bo, &csb->pvr_bo_list, link) {
          list_del(&pvr_bo->link);
+         /* Return CSB BOs to the pool rather than destroying them, so the
+          * kernel DRM create_bo / vm_map ioctls are not repeated each frame. */
+         if (csb->device && pvr_bo->bo->size == PVR_CMD_BUFFER_CSB_BO_SIZE) {
+            simple_mtx_lock(&csb->device->csb_bo_pool_mtx);
+            if (csb->device->csb_bo_pool_count < PVR_CSB_BO_POOL_MAX) {
+               list_addtail(&pvr_bo->link, &csb->device->csb_bo_pool);
+               csb->device->csb_bo_pool_count++;
+               simple_mtx_unlock(&csb->device->csb_bo_pool_mtx);
+               continue;
+            }
+            simple_mtx_unlock(&csb->device->csb_bo_pool_mtx);
+         }
          pvr_bo_free(csb->device, pvr_bo);
       }
    }

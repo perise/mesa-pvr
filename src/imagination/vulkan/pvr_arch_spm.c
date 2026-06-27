@@ -795,75 +795,112 @@ VkResult pvr_arch_spm_init_bgobj_state(
 
    consts_buffer_size = PVR_DW_TO_BYTES(pvr_uscgen_spm_load_data_size(&props));
 
-   result = pvr_bo_alloc(device,
-                         device->heaps.general_heap,
-                         consts_buffer_size,
-                         sizeof(uint32_t),
-                         PVR_BO_ALLOC_FLAG_CPU_MAPPED,
-                         &spm_bgobj_state->consts_buffer);
-   if (result != VK_SUCCESS)
-      return result;
+   /* Save cache key into bgobj_state so pvr_spm_finish_bgobj_state can
+    * return the consts_buffer BO to the device cache instead of freeing it.
+    */
+   spm_bgobj_state->cache_scratch_addr = next_scratch_buffer_addr.addr;
+   spm_bgobj_state->cache_fw = framebuffer_size.width;
+   spm_bgobj_state->cache_fh = framebuffer_size.height;
+   spm_bgobj_state->cache_sample_count = hw_render->sample_count;
+   spm_bgobj_state->cache_output_reg_count = props.output_reg_count;
+   spm_bgobj_state->cache_tile_buffer_count = props.tile_buffer_count;
+   spm_bgobj_state->cache_is_multisampled = props.is_multisampled;
 
-   mem_ptr = spm_bgobj_state->consts_buffer->bo->map;
+   /* Check device bgobj consts_buffer cache: if render params match, reuse
+    * the existing BO (identical content) and skip the expensive pvr_bo_alloc.
+    */
+   {
+      bool hit = false;
+      simple_mtx_lock(&device->bgobj_cache_mtx);
+      if (device->bgobj_cache_bo &&
+          device->bgobj_cache_scratch_addr == next_scratch_buffer_addr.addr &&
+          device->bgobj_cache_fw == framebuffer_size.width &&
+          device->bgobj_cache_fh == framebuffer_size.height &&
+          device->bgobj_cache_sample_count == hw_render->sample_count &&
+          device->bgobj_cache_output_reg_count == props.output_reg_count &&
+          device->bgobj_cache_tile_buffer_count == props.tile_buffer_count &&
+          device->bgobj_cache_is_multisampled == props.is_multisampled) {
+         spm_bgobj_state->consts_buffer = device->bgobj_cache_bo;
+         device->bgobj_cache_bo = NULL;
+         hit = true;
+      }
+      simple_mtx_unlock(&device->bgobj_cache_mtx);
 
-   for (unsigned u = 0; u < hw_render->tile_buffers_count; ++u) {
-      unsigned tile_buffer_addr_location = pvr_uscgen_spm_buffer_data(u, true);
-      pvr_dev_addr_t tile_buffer_addr =
-         device->tile_buffer_state.buffers[u]->vma->dev_addr;
+      if (!hit) {
+         /* Cache miss: allocate fresh BO and fill in the constants. */
+         result = pvr_bo_alloc(device,
+                               device->heaps.general_heap,
+                               consts_buffer_size,
+                               sizeof(uint32_t),
+                               PVR_BO_ALLOC_FLAG_CPU_MAPPED,
+                               &spm_bgobj_state->consts_buffer);
+         if (result != VK_SUCCESS)
+            return result;
 
-      mem_ptr[tile_buffer_addr_location] = tile_buffer_addr.addr & 0xffffffff;
-      mem_ptr[tile_buffer_addr_location + 1] = tile_buffer_addr.addr >> 32;
-   }
+         mem_ptr = spm_bgobj_state->consts_buffer->bo->map;
 
-   descriptor =
-      (struct pvr_sampler_descriptor *)&mem_ptr[PVR_SPM_LOAD_DATA_SMP];
-   pvr_csb_pack (&descriptor->words[0], TEXSTATE_SAMPLER_WORD0, sampler) {
-      sampler.non_normalized_coords = true;
-      sampler.addrmode_v = ROGUE_TEXSTATE_ADDRMODE_CLAMP_TO_EDGE;
-      sampler.addrmode_u = ROGUE_TEXSTATE_ADDRMODE_CLAMP_TO_EDGE;
-      sampler.minfilter = ROGUE_TEXSTATE_FILTER_POINT;
-      sampler.magfilter = ROGUE_TEXSTATE_FILTER_POINT;
-      sampler.maxlod = ROGUE_TEXSTATE_CLAMP_MIN;
-      sampler.minlod = ROGUE_TEXSTATE_CLAMP_MIN;
-      sampler.dadjust = ROGUE_TEXSTATE_DADJUST_ZERO_UINT;
-   }
+         for (unsigned u = 0; u < hw_render->tile_buffers_count; ++u) {
+            unsigned tile_buffer_addr_location =
+               pvr_uscgen_spm_buffer_data(u, true);
+            pvr_dev_addr_t tile_buffer_addr =
+               device->tile_buffer_state.buffers[u]->vma->dev_addr;
 
-   pvr_csb_pack (&descriptor->words[1], TEXSTATE_SAMPLER_WORD1, sampler) {}
+            mem_ptr[tile_buffer_addr_location] =
+               tile_buffer_addr.addr & 0xffffffff;
+            mem_ptr[tile_buffer_addr_location + 1] =
+               tile_buffer_addr.addr >> 32;
+         }
 
-   uint64_t mem_used = 0;
-   /* Setup image descriptor for reg output. */
-   result =
-      pvr_spm_setup_texture_state_words(device,
-                                        dword_count,
-                                        framebuffer_size,
-                                        hw_render->sample_count,
-                                        next_scratch_buffer_addr,
-                                        &mem_ptr[PVR_SPM_LOAD_DATA_REG_TEX],
-                                        &mem_used);
-   if (result != VK_SUCCESS)
-      goto err_free_consts_buffer;
+         descriptor =
+            (struct pvr_sampler_descriptor *)&mem_ptr[PVR_SPM_LOAD_DATA_SMP];
+         pvr_csb_pack (&descriptor->words[0], TEXSTATE_SAMPLER_WORD0, sampler) {
+            sampler.non_normalized_coords = true;
+            sampler.addrmode_v = ROGUE_TEXSTATE_ADDRMODE_CLAMP_TO_EDGE;
+            sampler.addrmode_u = ROGUE_TEXSTATE_ADDRMODE_CLAMP_TO_EDGE;
+            sampler.minfilter = ROGUE_TEXSTATE_FILTER_POINT;
+            sampler.magfilter = ROGUE_TEXSTATE_FILTER_POINT;
+            sampler.maxlod = ROGUE_TEXSTATE_CLAMP_MIN;
+            sampler.minlod = ROGUE_TEXSTATE_CLAMP_MIN;
+            sampler.dadjust = ROGUE_TEXSTATE_DADJUST_ZERO_UINT;
+         }
 
-   next_scratch_buffer_addr =
-      PVR_DEV_ADDR_OFFSET(next_scratch_buffer_addr, mem_used);
+         pvr_csb_pack (&descriptor->words[1], TEXSTATE_SAMPLER_WORD1,
+                       sampler) {}
 
-   /* Setup image descriptors for tile buffer outputs. */
-   for (unsigned u = 0; u < hw_render->tile_buffers_count; ++u) {
-      unsigned tile_buffer_tex_state_location =
-         pvr_uscgen_spm_buffer_data(u, false);
+         uint64_t mem_used = 0;
+         result =
+            pvr_spm_setup_texture_state_words(device,
+                                              dword_count,
+                                              framebuffer_size,
+                                              hw_render->sample_count,
+                                              next_scratch_buffer_addr,
+                                              &mem_ptr[PVR_SPM_LOAD_DATA_REG_TEX],
+                                              &mem_used);
+         if (result != VK_SUCCESS)
+            goto err_free_consts_buffer;
 
-      result = pvr_spm_setup_texture_state_words(
-         device,
-         dword_count,
-         framebuffer_size,
-         hw_render->sample_count,
-         next_scratch_buffer_addr,
-         &mem_ptr[tile_buffer_tex_state_location],
-         &mem_used);
-      if (result != VK_SUCCESS)
-         goto err_free_consts_buffer;
+         next_scratch_buffer_addr =
+            PVR_DEV_ADDR_OFFSET(next_scratch_buffer_addr, mem_used);
 
-      next_scratch_buffer_addr =
-         PVR_DEV_ADDR_OFFSET(next_scratch_buffer_addr, mem_used);
+         for (unsigned u = 0; u < hw_render->tile_buffers_count; ++u) {
+            unsigned tile_buffer_tex_state_location =
+               pvr_uscgen_spm_buffer_data(u, false);
+
+            result = pvr_spm_setup_texture_state_words(
+               device,
+               dword_count,
+               framebuffer_size,
+               hw_render->sample_count,
+               next_scratch_buffer_addr,
+               &mem_ptr[tile_buffer_tex_state_location],
+               &mem_used);
+            if (result != VK_SUCCESS)
+               goto err_free_consts_buffer;
+
+            next_scratch_buffer_addr =
+               PVR_DEV_ADDR_OFFSET(next_scratch_buffer_addr, mem_used);
+         }
+      }
    }
 
    load_program_state =

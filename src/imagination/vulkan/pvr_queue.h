@@ -38,6 +38,16 @@ struct pvr_queue {
 
    struct vk_sync *last_job_signal_sync[PVR_JOB_TYPE_MAX];
    struct vk_sync *next_job_wait_sync[PVR_JOB_TYPE_MAX];
+
+   /* Sync pool: reuse DRM syncobjs across frames to avoid alloc/free per pass.
+    * sync_pending: retired this frame (GPU may still be using them).
+    * sync_ready:   reset and ready to reuse next frame.
+    * Both are recycled in pvr_clear_last_submits_syncs after GPU completes. */
+#define PVR_SYNC_POOL_SIZE 32U
+   struct vk_sync *sync_pending[PVR_SYNC_POOL_SIZE];
+   uint32_t sync_pending_count;
+   struct vk_sync *sync_ready[PVR_SYNC_POOL_SIZE];
+   uint32_t sync_ready_count;
 };
 
 VK_DEFINE_HANDLE_CASTS(pvr_queue, vk.base, VkQueue, VK_OBJECT_TYPE_QUEUE)

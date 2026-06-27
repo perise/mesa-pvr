@@ -23,33 +23,33 @@ jobs:
           git log --oneline | grep -q cff8dbd && echo "BASE FOUND" \
             || { echo "cff8dbd not found"; exit 1; }
 
-      - name: Apply K3 patches
+      - name: Create orphan branch + apply K3 patches
         run: |
           cd mesa
           git config user.email "perise@gmail.com"
           git config user.name "perise"
-          git checkout -b k3-optimizations cff8dbd4
+
+          echo "=== cff8dbd4 info ==="
+          git cat-file -p cff8dbd4 | head -4
+
+          # Create orphan root from cff8dbd4 tree — no parent = no shallow boundary issue
+          BASE_TREE=$(git cat-file -p cff8dbd4 | grep '^tree' | awk '{print $2}')
+          ROOT=$(git commit-tree "$BASE_TREE" \
+            -m "Mesa base: cff8dbd452b8 (2026-06-16) [K3 SpacemiT branch root]")
+          echo "Orphan root: $ROOT"
+
+          git checkout -b k3-optimizations "$ROOT"
           git am ../patches-repo/000*.patch
           git log --oneline -8
 
-      - name: Diagnose and push
+      - name: Push to GitHub
         env:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           cd mesa
-          echo "=== fsck (missing objects?) ==="
-          git fsck --strict 2>&1 | head -10 || true
-          echo "=== Missing object type ==="
-          git cat-file -t e6703f8e6849878c451f082ea485f9d685379328 2>&1 || echo "NOT IN LOCAL REPO"
-          echo "=== Repack with no deltas ==="
-          git config pack.depth 0
-          git config pack.window 0
-          git repack -a -d
-          echo "=== Push (no deltas, fat pack) ==="
           git config http.postBuffer 524288000
           DEST="https://x-access-token:${TOKEN}@github.com/perise/mesa-pvr.git"
           git remote add dest "$DEST"
-          git push --force --no-thin --verbose dest main:mesa-upstream
-          echo "EXIT_MAIN=$?"
-          git push --force --no-thin --verbose dest k3-optimizations
-          echo "EXIT_K3=$?"
+          echo "=== Push k3-optimizations ==="
+          git push --force --verbose dest k3-optimizations
+          echo "EXIT=$?"

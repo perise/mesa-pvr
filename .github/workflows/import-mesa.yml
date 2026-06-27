@@ -16,7 +16,7 @@ jobs:
           path: patches-repo
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Setup git auth for push
+      - name: Setup git auth
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -24,26 +24,29 @@ jobs:
           git config --global user.email "perise@gmail.com"
           git config --global user.name "perise"
 
-      - name: Clone Mesa from upstream
+      - name: Clone Mesa (depth=1000, covers 3+ weeks of commits)
         run: |
-          git clone --depth=500 --single-branch --branch main \
+          git clone --depth=1000 --single-branch --branch main \
             https://gitlab.freedesktop.org/mesa/mesa.git mesa
           cd mesa
+          echo "Total commits in shallow clone: $(git rev-list --count HEAD)"
           git log --oneline -3
-          git log --oneline | grep cff8dbd && echo "BASE FOUND" \
-            || { echo "ERROR: cff8dbd not found, use --depth=1000"; exit 1; }
+          git log --oneline | grep cff8dbd \
+            && echo "BASE COMMIT FOUND" \
+            || { echo "ERROR: cff8dbd not found, need deeper clone"; exit 1; }
 
-      - name: Create k3-optimizations branch and apply patches
+      - name: Apply K3 patches onto k3-optimizations branch
         run: |
           cd mesa
           git checkout -b k3-optimizations cff8dbd4
           git am ../patches-repo/000*.patch
           git log --oneline -8
 
-      - name: Push to perise/mesa-pvr
+      - name: Push both branches to perise/mesa-pvr
         run: |
           cd mesa
           git remote add dest https://github.com/perise/mesa-pvr.git
-          git push --force dest main 2>&1 && echo "main pushed"
-          git push --force dest k3-optimizations 2>&1 && echo "k3-optimizations pushed"
+          git push --force dest main
+          git push --force dest k3-optimizations
+          echo "Success! Remote now has:"
           git ls-remote dest refs/heads/main refs/heads/k3-optimizations

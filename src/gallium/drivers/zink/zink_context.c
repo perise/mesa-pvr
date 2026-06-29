@@ -3653,7 +3653,8 @@ zink_batch_no_rp_safe(struct zink_context *ctx)
       k3_zink_ctx_stats.end_rendering++;
    }
    VKCTX(CmdEndRendering)(ctx->bs->cmdbuf);
-   if (zink_debug & ZINK_DEBUG_RPSTORES) {
+   if ((zink_debug & ZINK_DEBUG_RPSTORES) ||
+       zink_screen(ctx->base.screen)->driver_workarounds.optimize_rp_stores) {
       bool zap = false;
       for (unsigned i = 0; i < ARRAY_SIZE(ctx->dynamic_fb.attachments); i++) {
          if (ctx->dynamic_fb.attachments[i].storeOp != VK_ATTACHMENT_STORE_OP_DONT_CARE) {

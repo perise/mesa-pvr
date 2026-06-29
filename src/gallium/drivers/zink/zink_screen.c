@@ -3174,6 +3174,14 @@ init_driver_workarounds(struct zink_screen *screen)
    if (zink_debug & ZINK_DEBUG_NOGENERAL)
       screen->driver_workarounds.general_layout = false;
 
+   switch (zink_driverid(screen)) {
+   case VK_DRIVER_ID_IMAGINATION_OPEN_SOURCE_MESA:
+      screen->driver_workarounds.optimize_rp_stores = true;
+      break;
+   default:
+      break;
+   }
+
    if (!screen->resizable_bar)
       screen->info.have_EXT_host_image_copy = false;
 

@@ -1556,6 +1556,7 @@ struct zink_screen {
       bool can_2d_view_sparse;
       bool general_depth_layout;
       bool general_layout;
+      bool optimize_rp_stores;
       /* intel driver is somehow broken for srgb-compatible dmabufs...but only in mesa CI */
       bool srgb_dmabufs;
    } driver_workarounds;

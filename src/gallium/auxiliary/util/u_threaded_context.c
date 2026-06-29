@@ -25,8 +25,6 @@
  **************************************************************************/
 
 #include "util/u_threaded_context.h"
-#include <inttypes.h>
-#include <time.h>
 #include "util/u_cpu_detect.h"
 #include "util/format/u_format.h"
 #include "util/u_framebuffer.h"
@@ -1068,13 +1066,6 @@ tc_is_buffer_on_busy_list(const struct threaded_context *tc, const struct thread
    uint32_t id_hash = tbuf->buffer_id_unique & TC_BUFFER_ID_MASK;
 
    for (unsigned i = 0; i < TC_MAX_BUFFER_LISTS; i++) {
-      /* K3 OPT: Skip the current (not-yet-submitted) batch list.
-       * A buffer only in next_buf_list was just created by tc_invalidate_buffer
-       * and has never been submitted to the GPU. Treating it as busy forces staging
-       * (99x vkCmdCopyBuffer/frame). Skipping lets UNSYNC direct-map the new BO
-       * from the main thread, matching buffer:map performance. */
-      if (i == (int)tc->next_buf_list)
-         continue;
       struct tc_buffer_list *buf_list = (void*)&tc->buffer_lists[i];
 
       /* If the buffer is referenced by a batch that hasn't been flushed (by tc or the driver),
@@ -3237,17 +3228,18 @@ tc_buffer_subdata(struct pipe_context *_pipe,
 
       u_box_1d(offset, size, &box);
 
-      /* K3 SUBDATA OPT: for full-buffer updates on allow_cpu_storage VBOs,
-       * call tc_invalidate_buffer first to obtain a fresh idle backing.
-       * tc_improve then infers UNSYNC, giving a single main-thread memcpy
-       * instead of the staging path incurred when the old backing is GPU-busy.
-       * Without this, buffer:subdata suffers the same busy-backing stall that
-       * Patch A+K3 OPT fix for buffer:map: the backing from frame N is still
-       * referenced in the submitted batch so tc_improve refuses to UNSYNC it.
-       * CPU storage is only useful for partial updates otherwise. */
+      /* For full-buffer updates on allow_cpu_storage buffers, try to orphan
+       * first. If this creates fresh storage, we can map it unsynchronized
+       * without weakening the normal busy-list checks for other buffers.
+       */
       if (!tres->cpu_storage && offset == 0 && size == resource->width0) {
-         if (tres->allow_cpu_storage)
-            tc_invalidate_buffer(tc, tres); /* new backing → idle → UNSYNC */
+         if (tres->allow_cpu_storage) {
+            uint32_t id_before = tres->buffer_id_unique;
+
+            if (tc_invalidate_buffer(tc, tres) &&
+                tres->buffer_id_unique != id_before)
+               usage |= PIPE_MAP_UNSYNCHRONIZED;
+         }
          usage |= TC_TRANSFER_MAP_UPLOAD_CPU_STORAGE;
       }
 

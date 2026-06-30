@@ -817,7 +817,8 @@ zink_init_screen_caps(struct zink_screen *screen)
    caps->seamless_cube_map_per_texture = true;
    caps->load_constbuf = true;
    caps->multisample_z_resolve = true;
-   caps->allow_glthread_buffer_subdata_opt = true;
+   caps->allow_glthread_buffer_subdata_opt =
+      zink_driverid(screen) != VK_DRIVER_ID_IMAGINATION_OPEN_SOURCE_MESA;
    caps->nir_samplers_as_deref = true;
    caps->call_finalize_nir_in_linker = true;
    caps->representative_fragment_test = screen->info.dynamic_state3_feats.extendedDynamicState3RepresentativeFragmentTestEnable;

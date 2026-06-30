@@ -2131,8 +2131,8 @@ static VkResult pvr_sub_cmd_gfx_job_init(const struct pvr_device_info *dev_info,
       job->run_frag = true;
    }
 
-   /* TODO: Enable pixel merging when it's safe to do. */
-   job->disable_pixel_merging = true;
+   /* K3: pixel merging improves 1080p glmark2 throughput on BXM-4-64. */
+   job->disable_pixel_merging = false;
 
    if (k3_pvr_trace_enabled()) {
       const VkExtent2D extent = render_pass_info->render_area.extent;

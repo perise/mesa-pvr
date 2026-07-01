@@ -3078,7 +3078,9 @@ tc_buffer_unmap(struct pipe_context *_pipe, struct pipe_transfer *transfer)
              * idle -> fast direct write) or falls through to staging
              * (buffer busy -> resource_copy_region, safe). */
             tc_buffer_subdata(&tc->base, &tres->b,
-                              TC_TRANSFER_MAP_UPLOAD_CPU_STORAGE,
+                              TC_TRANSFER_MAP_UPLOAD_CPU_STORAGE |
+                              (tc->options.direct_cpu_storage_upload ?
+                               PIPE_MAP_DIRECTLY : 0),
                               ttrans->b.box.x, ttrans->b.box.width,
                               (uint8_t*)tres->cpu_storage + ttrans->b.box.x);
          }

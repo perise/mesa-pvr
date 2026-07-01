@@ -6161,6 +6161,8 @@ zink_context_create(struct pipe_screen *pscreen, void *priv, unsigned flags)
                                                         .unsynchronized_get_device_reset_status = true,
                                                         .unsynchronized_texture_subdata = true,
                                                         .parse_renderpass_info = screen->driver_workarounds.track_renderpasses,
+                                                        .direct_cpu_storage_upload =
+                                                           zink_driverid(screen) == VK_DRIVER_ID_IMAGINATION_OPEN_SOURCE_MESA,
                                                         .dsa_parse = zink_tc_parse_dsa,
                                                         .fs_parse = zink_tc_parse_fs,
                                                      },

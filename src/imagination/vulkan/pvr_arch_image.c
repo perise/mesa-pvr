@@ -7,6 +7,7 @@
 #include "pvr_image.h"
 
 #include <assert.h>
+#include <stdbool.h>
 #include <stdint.h>
 
 #include "vk_log.h"
@@ -190,14 +191,23 @@ VkResult PVR_PER_ARCH(CreateImageView)(VkDevice _device,
 
    util_format_compose_swizzles(format_swizzle, input_swizzle, info.swizzle);
 
-   /* K3 OPT: Tag render-target-only TWIDDLED images for FBCDC compression.
-    * These are written exclusively by the PBE (not by the transfer engine),
-    * so the TPU can read them in FB_DIRECT_8X8 compression mode. */
+   const VkImageUsageFlags image_usage = image->vk.usage;
+   const bool sampled_rt =
+      (image_usage & VK_IMAGE_USAGE_SAMPLED_BIT) &&
+      (image_usage & VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT) &&
+      !(image_usage & VK_IMAGE_USAGE_STORAGE_BIT);
+
+   /* K3 OPT: Tag TWIDDLED render-to-texture images for FBCDC compression so
+    * the TPU can read them in FB_DIRECT_8X8 mode. Zink adds TRANSFER_DST to
+    * render targets whenever the format supports it, even when the resource is
+    * used as a PBE-written render target, so keep FBCDC enabled for sampled
+    * input/color attachments.
+    */
    info.fbcdc_compressed =
       PVR_HAS_FEATURE(&device->pdevice->dev_info, fbcdc_algorithm) &&
       image->memlayout == PVR_MEMLAYOUT_TWIDDLED &&
-      (image->vk.usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) &&
-      !(image->vk.usage & VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+      (image_usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) &&
+      (!(image_usage & VK_IMAGE_USAGE_TRANSFER_DST_BIT) || sampled_rt);
 
    result = pvr_arch_pack_tex_state(device,
                                     &info,

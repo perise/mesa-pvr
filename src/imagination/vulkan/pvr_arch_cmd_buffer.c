@@ -1308,12 +1308,23 @@ static void pvr_setup_pbe_state(
    surface_params.height = iview->vk.extent.height;
    surface_params.z_only_render = false;
    surface_params.down_scale = down_scale;
-   /* K3 OPT: Enable FBCDC for TWIDDLED colour-attachment-only images. */
+
+   const VkImageUsageFlags image_usage = image->vk.usage;
+   const bool sampled_rt =
+      (image_usage & VK_IMAGE_USAGE_SAMPLED_BIT) &&
+      (image_usage & VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT) &&
+      !(image_usage & VK_IMAGE_USAGE_STORAGE_BIT);
+
+   /* K3 OPT: Enable FBCDC for TWIDDLED render-to-texture images. Zink adds
+    * TRANSFER_DST to render targets whenever the format supports it, even when
+    * the resource is used as a PBE-written render target, so keep FBCDC enabled
+    * for sampled input/color attachments.
+    */
    surface_params.enable_fbcdc =
       PVR_HAS_FEATURE(dev_info, fbcdc_algorithm) &&
       image->memlayout == PVR_MEMLAYOUT_TWIDDLED &&
-      (image->vk.usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) &&
-      !(image->vk.usage & VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+      (image_usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) &&
+      (!(image_usage & VK_IMAGE_USAGE_TRANSFER_DST_BIT) || sampled_rt);
 
    /* Setup render parameters. */
 

@@ -1520,6 +1520,7 @@ struct zink_screen {
       bool inline_uniforms;
       bool emulate_point_smooth;
       bool zink_shader_object_enable;
+      int max_texture_2d_size;
    } driconf;
 
    struct zink_format_props format_props[PIPE_FORMAT_COUNT];

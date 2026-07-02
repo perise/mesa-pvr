@@ -8,6 +8,7 @@ DRI_CONF_SECTION_END
 DRI_CONF_SECTION_PERFORMANCE
 DRI_CONF_MESA_GLTHREAD_DRIVER(true)
 DRI_CONF_OPT_B(zink_shader_object_enable, false, "Enable support for EXT_shader_object")
+DRI_CONF_OPT_I(zink_max_texture_2d_size, 0, 0, 16384, "Clamp the advertised maximum 2D texture size; 0 disables the clamp")
 DRI_CONF_SECTION_END
 
 DRI_CONF_SECTION_QUALITY

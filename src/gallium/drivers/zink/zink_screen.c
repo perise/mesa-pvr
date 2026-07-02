@@ -939,6 +939,9 @@ zink_init_screen_caps(struct zink_screen *screen)
    caps->max_texture_2d_size =
       MIN3(screen->info.props.limits.maxImageDimension1D,
            screen->info.props.limits.maxImageDimension2D, 16384);
+   if (screen->driconf.max_texture_2d_size > 0)
+      caps->max_texture_2d_size =
+         MIN2(caps->max_texture_2d_size, screen->driconf.max_texture_2d_size);
    caps->max_texture_3d_levels =
       1 + util_logbase2(screen->info.props.limits.maxImageDimension3D);
    caps->max_texture_cube_levels =
@@ -3436,6 +3439,7 @@ zink_internal_create_screen(const struct pipe_screen_config *config, int64_t dev
       //screen->driconf.inline_uniforms = driQueryOptionb(config->options, "radeonsi_inline_uniforms");
       screen->driconf.emulate_point_smooth = driQueryOptionb(config->options, "zink_emulate_point_smooth");
       screen->driconf.zink_shader_object_enable = driQueryOptionb(config->options, "zink_shader_object_enable");
+      screen->driconf.max_texture_2d_size = driQueryOptioni(config->options, "zink_max_texture_2d_size");
    }
 
    simple_mtx_lock(&instance_lock);
